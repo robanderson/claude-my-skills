@@ -1,0 +1,13 @@
+{
+  "name": "mockoon-cli",
+  "version": "1.0.0",
+  "description": "Use Mockoon CLI to create API proxies with full request/response logging, mock API servers for testing, and record real API interactions for debugging",
+  "author": {
+    "name": "Rob Anderson"
+  },
+  "license": "MIT",
+  "keywords": ["api", "mock", "proxy", "testing", "debugging", "mockoon"],
+  "components": {
+    "skills": ["mockoon-cli"]
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "my-skills",
+  "version": "1.0.0",
+  "description": "My custom Claude Code skills",
+  "owner": {
+    "name": "Rob Anderson"
+  },
+  "plugins": [
+    {
+      "name": "uv-python-manager",
+      "description": "Standardize Python development using UV - a fast, unified package and project manager",
+      "source": "./uv-python-manager"
+    },
+    {
+      "name": "mockoon-cli",
+      "description": "Use Mockoon CLI to create API proxies with full request/response logging, mock API servers for testing, and record real API interactions for debugging",
+      "source": "./mockoon-cli"
+    }
+  ]
+}
