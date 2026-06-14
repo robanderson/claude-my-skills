@@ -87,6 +87,7 @@ const q = s => "'" + String(s).replace(/'/g, "'\\''") + "'" // single-quote shel
 const glmRunner = A.glmRunner
 const localRunner = A.localRunner
 const codexRunner = A.codexRunner
+const minimaxRunner = A.minimaxRunner
 // Per-attempt guards for GLM/local runners (enforced inside the runner scripts):
 //  - max-turns: PRIMARY guard — caps agentic iterations so single-pass attempts can't
 //    grind the write->run->fix loop (which balloons context, esp. on local models).
@@ -95,6 +96,8 @@ const codexRunner = A.codexRunner
 // "single pass" and burn turns on a verify-and-polish loop (observed on Qwen).
 const glmMaxTurns = Number(A.attemptMaxTurns) > 0 ? Math.floor(Number(A.attemptMaxTurns)) : 30
 const localMaxTurns = Number(A.localMaxTurns) > 0 ? Math.floor(Number(A.localMaxTurns)) : 20
+// MiniMax exposes one model (MiniMax-M3); its runner reuses the GLM-style guards (default to glmMaxTurns).
+const minimaxMaxTurns = Number(A.minimaxMaxTurns) > 0 ? Math.floor(Number(A.minimaxMaxTurns)) : glmMaxTurns
 const attemptTimeout = Number(A.attemptTimeoutSecs) > 0 ? Math.floor(Number(A.attemptTimeoutSecs)) : 300
 // Codex exec is agentic with NO turn cap (no --max-turns flag), so the wall-clock timeout is its ONLY
 // per-attempt backstop and gets its own, roomier default. Override via args.codexTimeoutSecs.
@@ -156,6 +159,10 @@ function dispatch(a, ws, guidance, phaseTitle) {
     opts.agentType = nsAgent(a.agentType) // farnsworth-codex (one generic agent for every codex effort)
     const flag = CODEX_FLAG[a.displayModel] || `-m ${a.model}` // gpt-5.5 + reasoning-effort flags -> codex exec
     prompt = RUNVERBATIM(codexRunnerCmd(codexRunner, flag, ws, b), ws, '_codex_run.log')
+  } else if (a.dispatch === 'minimax') {
+    opts.agentType = nsAgent(a.agentType) // farnsworth-minimax (one generic agent; MiniMax exposes only MiniMax-M3)
+    // No --model flag: the runner's ANTHROPIC_MODEL pins MiniMax-M3 (all aliases map to it).
+    prompt = RUNVERBATIM(runnerCmd(minimaxRunner, '', ws, b, minimaxMaxTurns), ws, '_minimax_run.log')
   } else {
     // Native Anthropic attempt. NOTE: the workflow agent() primitive exposes no turn/time cap,
     // so (unlike GLM/local) these are bounded only by the single-pass brief. If a future agent()
@@ -263,6 +270,7 @@ async function stageAndValidate(list, reviewDir, phaseTitle) {
     const log = c.dispatch === 'glm' ? '_glm_run.log'
               : c.dispatch === 'local' ? '_local_run.log'
               : c.dispatch === 'codex' ? '_codex_run.log'
+              : c.dispatch === 'minimax' ? '_minimax_run.log'
               : ''
     const lp = log ? q(`${c.ws}/${log}`) : ''
     // Provider-specific, LINE-ANCHORED marker token. Runners write their FARNSWORTH-<PROV>-* markers at
@@ -272,12 +280,12 @@ async function stageAndValidate(list, reviewDir, phaseTitle) {
     // false-negative was real: it invalidated two genuinely-successful GLM proposals about this very feature.
     // FAIL CLOSED (#2): the PROVENANCE line is written UNCONDITIONALLY at runner startup, so a missing log
     // here means the runner never ran (native-solve spoof / refusal) → P=0. Native attempts (no runner) → P=1.
-    const tok = c.dispatch === 'glm' ? 'GLM' : c.dispatch === 'local' ? 'LOCAL' : c.dispatch === 'codex' ? 'CODEX' : ''
+    const tok = c.dispatch === 'glm' ? 'GLM' : c.dispatch === 'local' ? 'LOCAL' : c.dispatch === 'codex' ? 'CODEX' : c.dispatch === 'minimax' ? 'MINIMAX' : ''
     const provChk = log
       ? `if [ -f ${lp} ]; then if grep -q '^FARNSWORTH-${tok}-PROVENANCE endpoint=' ${lp} && grep -q '^FARNSWORTH-${tok}-DONE exit=0' ${lp} && ! grep -q '^FARNSWORTH-${tok}-\\(TIMEOUT\\|ERROR\\)' ${lp}; then P=1; else P=0; fi; else P=0; fi`
       : `P=1`
     return `mkdir -p ${q(dest)}; cp -R ${q(c.ws)}/. ${q(dest)}/ 2>/dev/null; ` +
-           `rm -f ${q(dest)}/_brief.txt ${q(dest)}/_glm_run.log ${q(dest)}/_local_run.log ${q(dest)}/_codex_run.log ${q(dest)}/_codex_last.txt; ` +
+           `rm -f ${q(dest)}/_brief.txt ${q(dest)}/_glm_run.log ${q(dest)}/_local_run.log ${q(dest)}/_codex_run.log ${q(dest)}/_codex_last.txt ${q(dest)}/_minimax_run.log; ` +
            `D=$(find ${q(dest)} -type f 2>/dev/null | grep -c .); ${provChk}; ` +
            `if [ "$D" -gt 0 ] && [ "$P" -eq 1 ]; then { echo "===== Candidate ${c.blind} ====="; cat ${q(dest)}/* 2>/dev/null; echo; } >> ${q(pool)}; fi; ` +
            `echo "FLV ${c.blind} d=$([ "$D" -gt 0 ] && echo 1 || echo 0) p=$P"`

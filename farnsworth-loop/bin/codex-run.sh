@@ -29,6 +29,10 @@ echo "FARNSWORTH-CODEX-PROVENANCE endpoint=api.openai.com flag=${FLAG} timeout=$
 # Portable hard timeout (macOS has no coreutils `timeout`): fork the call, SIGALRM -> TERM/KILL. The
 # >>LOG redirect is applied by the OUTER shell to the whole perl command (matches glm-run.sh's shape);
 # $FLAG is unquoted so the outer shell word-splits it into separate argv elements before perl exec.
+# </dev/null pins codex's stdin: with a prompt ARG but an OPEN (non-TTY) stdin, codex prints
+# "Reading additional input from stdin..." and BLOCKS to the wall-clock timeout (exit 124) instead of
+# running. The agent Bash context happens to close stdin (so the tournament worked), but a direct or
+# differently-configured caller leaving stdin open would hang — so close it here and never rely on the caller.
 perl -e '
   my $t = shift @ARGV;
   my $p = fork; if (!defined $p) { exit 127 }
@@ -43,13 +47,19 @@ perl -e '
     -c 'mcp_servers={}' \
     -o "$LAST" \
     $FLAG \
-    "$(cat _brief.txt)" >> "$LOG" 2>&1
+    "$(cat _brief.txt)" </dev/null >> "$LOG" 2>&1
 RC=$?
 
-# Defensive fail-closed (belt-and-suspenders beyond the exit code): if the log shows an unambiguous
-# terminal model/auth/version failure, force a nonzero RC so the provenance check (DONE exit=0) rejects
-# it even on the rare path where codex returns such an error yet still exits 0.
-if grep -qiE 'requires a newer version of Codex|is not supported when using Codex with a|invalid_api_key|401 Unauthorized|403 Forbidden' "$LOG"; then
+# Defensive fail-closed (belt-and-suspenders beyond the exit code): if codex hit a terminal
+# model/auth/version failure, force a nonzero RC so the provenance check (DONE exit=0) rejects it
+# even on the rare path where codex returns such an error yet still exits 0.
+# GUARD (-s "$LAST"): only force-fail when codex produced NO final message. A real auth/model/version
+# failure aborts BEFORE any model output, so $LAST is empty/absent; a SUCCESSFUL run that merely
+# *discusses* these phrases (e.g. a deliverable about codex auth) writes a normal $LAST and must NOT be
+# force-failed. Without this guard, unanchored grep over the full transcript false-failed two genuinely
+# successful codex attempts whose task was designing this very provenance system. Mirrors the staging
+# validator's mention-proof anchoring fix.
+if [ ! -s "$LAST" ] && grep -qiE 'requires a newer version of Codex|is not supported when using Codex with a|invalid_api_key|401 Unauthorized|403 Forbidden' "$LOG"; then
   echo "FARNSWORTH-CODEX-ERROR codex reported a model/auth/version failure (see log)" >> "$LOG"
   [ "$RC" -eq 0 ] && RC=6
 fi

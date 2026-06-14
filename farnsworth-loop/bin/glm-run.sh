@@ -13,6 +13,10 @@ if [ -z "${ZAI_API_KEY:-}" ]; then echo "FARNSWORTH-GLM-ERROR ZAI_API_KEY missin
 
 echo "FARNSWORTH-GLM-PROVENANCE endpoint=api.z.ai flag=${FLAG} max-turns=${MAXTURNS} timeout=${TIMEOUT}s" >> "$LOG"
 # Portable hard timeout (no coreutils `timeout` on macOS): fork the call, SIGALRM -> TERM/KILL.
+# </dev/null pins claude's stdin: with a prompt ARG but an OPEN (non-TTY) stdin, claude warns
+# "no stdin data received in 3s" and can STALL the entire wall-clock producing NO output/deliverable
+# (observed: every GLM attempt = 4-line log, exit 124). The agent context sometimes closes stdin so it
+# worked before, but don't rely on the caller — close it here. (Mirrors the same fix in codex-run.sh.)
 ANTHROPIC_BASE_URL="https://api.z.ai/api/anthropic" \
 ANTHROPIC_AUTH_TOKEN="$ZAI_API_KEY" \
 ANTHROPIC_DEFAULT_OPUS_MODEL="glm-5.2[1m]" \
@@ -24,7 +28,7 @@ perl -e '
   if ($p == 0) { exec @ARGV; exit 127 }
   $SIG{ALRM} = sub { kill "TERM", $p; sleep 3; kill "KILL", $p; exit 124 };
   alarm $t; waitpid($p, 0); exit($? >> 8);
-' "$TIMEOUT" claude -p "$(cat _brief.txt)" $FLAG --max-turns "$MAXTURNS" --permission-mode acceptEdits --allowedTools "Bash Read Write Edit" >> "$LOG" 2>&1
+' "$TIMEOUT" claude -p "$(cat _brief.txt)" $FLAG --max-turns "$MAXTURNS" --permission-mode acceptEdits --allowedTools "Bash Read Write Edit" </dev/null >> "$LOG" 2>&1
 RC=$?
 [ "$RC" -eq 124 ] && echo "FARNSWORTH-GLM-TIMEOUT secs=${TIMEOUT}" >> "$LOG"
 echo "FARNSWORTH-GLM-DONE exit=$RC" >> "$LOG"
