@@ -46,6 +46,7 @@ Workflow({ scriptPath: "<plugin-root>/workflows/tournament.mjs", args: <ARGS> })
   task: "<exact task text>",
   mode: "single" | "two",
   runDir: "<absolute run dir>",          // e.g. <plugin>/.runs/<run-id>
+  contextFiles: ["<path>", ...],         // optional: known input files all workers need (see below)
   glmRunner: "<plugin-root>/bin/glm-run.sh",      // REQUIRED if any attempt is GLM
   localRunner: "<plugin-root>/bin/local-run.sh",  // REQUIRED if any attempt is Local
   attemptMaxTurns: 30,                    // optional iteration cap for GLM attempts; default 30
@@ -83,6 +84,8 @@ Workflow({ scriptPath: "<plugin-root>/workflows/tournament.mjs", args: <ARGS> })
 | glm-4.5-air | `farnsworth-loop:farnsworth-glm-4-5-air` |
 
 (Local attempts use `farnsworth-loop:farnsworth-local` for every model.)
+
+**Shared context bundle (`contextFiles`).** When the task has **known input files every worker needs** (e.g. "evaluate these skill files", "summarise this corpus", "audit these files"), pass their paths as `contextFiles`. The engine concatenates them ONCE — a single cheap `haiku` agent runs a `cat` — into `${runDir}/_context/_context.md`, and adds a line to every attempt's brief: *"shared context is at `<path>` — read that one file; don't re-read the underlying files."* This kills the dominant cost we measured: without it, every attempt independently re-reads the same files (a 4-attempt × 2-round run racked up ~86 Read calls, almost all duplicated). The bundle lives **outside** any candidate workspace and is `_`-prefixed, so the `[!_]*` staging glob never exposes it to the blind judge. Use it only for **known** inputs (facts everyone needs anyway — no diversity cost); it is NOT a research "scout" (discovering unknown inputs is a separate, optional concern with real diversity/bias tradeoffs).
 
 Anthropic attempts pass `dispatch:"anthropic"` + `model`; the workflow spawns them natively. GLM attempts pass `dispatch:"glm"` + `agentType` (per the map above) + `displayModel`. **Local attempts** pass `dispatch:"local"` + `agentType:"farnsworth-local"` + `model` (the exact omlx id, also used as `displayModel`). The workflow blind-labels candidates, the Opus reviewer/ranker **reads and runs each candidate's files** from its workspace (judges never receive model identities), and the script returns `{ round1.mapping, round1.review, guidance?, final.mapping, final.rank, final.winnerRound }` — everything Phase 6 needs to unblind and report.
 

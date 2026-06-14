@@ -1,6 +1,6 @@
 export const meta = {
   name: 'Farnsworth Loop',
-  description: 'Farnsworth Loop — a refined, multi-model best-of-N refinement loop: N parallel attempts judged blind by Anthropic Opus; two-pass adds a guided round and a final rank.',
+  description: 'A refined, multi-model best-of-N refinement loop: N parallel attempts judged blind by Anthropic Opus; two-pass adds a guided round and a final rank.',
   phases: [
     { title: 'Round 1' },
     { title: 'Review' },
@@ -31,18 +31,21 @@ if (!Array.isArray(attempts) || attempts.length === 0) {
 }
 const LABELS = 'ABCDEFGHIJKLMNOP'.split('')
 
-function brief(nudge, ws, guidance) {
+function brief(nudge, ws, guidance, ctx) {
   let g = ''
   if (guidance) {
     const pos = (guidance.positives || []).map(p => `- ${p}`).join('\n')
     const ch = (guidance.challenges || []).map(c => `- ${c}`).join('\n')
     g = `\nIn producing your answer, please consider these items as possible positives:\n${pos}\nAnd treat these items as challenges to avoid:\n${ch}\n`
   }
+  const ctxLine = ctx
+    ? `\nShared context for this task has ALREADY been gathered for you in one file: ${ctx}\nRead that single file at the start — it contains the source material you need. Do NOT re-read the underlying source files one by one (that work is already done).\n`
+    : ''
   return `You are solving a self-contained task. Produce ONE complete solution in a single focused pass.
 
 Task:
 ${task}
-${g}
+${g}${ctxLine}
 ${nudge}
 
 Rules:
@@ -82,6 +85,22 @@ const attemptTimeout = Number(A.attemptTimeoutSecs) > 0 ? Math.floor(Number(A.at
 const cmdHead = (ws, b) => `mkdir -p ${q(ws)} && cd ${q(ws)} && printf '%s' ${q(b)} > _brief.txt`
 const runnerCmd = (runner, flag, ws, b, maxTurns) => `${cmdHead(ws, b)} && FL_MAX_TURNS=${maxTurns} FL_TIMEOUT_SECS=${attemptTimeout} bash ${q(runner)} ${flag}`
 
+// Optional shared CONTEXT BUNDLE for known-input tasks (args.contextFiles = [paths/globs]).
+// Concatenate those files ONCE into a single file that every worker reads by path — instead of
+// each attempt re-reading the same source files (which dominated tool-use/latency in practice).
+// The bundle lives OUTSIDE any candidate workspace and is _-prefixed, so the [!_]* staging glob
+// never exposes it to the blind judge. No bundle is built when contextFiles is empty.
+const contextFiles = Array.isArray(A.contextFiles) ? A.contextFiles.filter(Boolean) : []
+const contextPath = contextFiles.length ? `${runDir}/_context/_context.md` : null
+async function buildContext() {
+  if (!contextPath) return
+  const cat = contextFiles.map(f => `echo "===== ${f} ====="; cat ${q(f)} 2>/dev/null || echo "(unreadable: ${f})"; echo`).join('; ')
+  const cmd = `mkdir -p ${q(`${runDir}/_context`)} && { ${cat} ; } > ${q(contextPath)} && wc -c ${q(contextPath)}`
+  log(`Bundling ${contextFiles.length} context file(s) → ${contextPath}`)
+  await agent(`Run this exact shell command in ONE Bash call and report its stdout. Do nothing else:\n\n${cmd}`,
+    { model: 'haiku', phase: 'Round 1', label: 'context' }).catch(() => null)
+}
+
 function glmInline(flag, ws, b) {
   return `${cmdHead(ws, b)} && ` +
     `echo "FARNSWORTH-GLM-PROVENANCE endpoint=api.z.ai flag=${flag}" >> _glm_run.log && ` +
@@ -100,7 +119,7 @@ const RUNVERBATIM = (cmd, ws, log) =>
 const nsAgent = t => (t && !t.includes(':')) ? `farnsworth-loop:${t}` : t
 
 function dispatch(a, ws, guidance, phaseTitle) {
-  const b = brief(guidance ? a.r2nudge : a.r1nudge, ws, guidance)
+  const b = brief(guidance ? a.r2nudge : a.r1nudge, ws, guidance, contextPath)
   const opts = { label: `${phaseTitle}:${a.displayModel}`, phase: phaseTitle }
   let prompt
   if (a.dispatch === 'glm') {
@@ -233,6 +252,7 @@ const blindLabel = (list, rot) => list.map((_, i) => list[(i + rot) % list.lengt
 
 // ---- Round 1 ----
 phase('Round 1')
+await buildContext() // shared context bundle (no-op unless args.contextFiles given) — built once, before the attempts
 log(`Round 1: ${attempts.length} attempts (${attempts.map(a => a.displayModel).join(', ')})`)
 const r1 = (await parallel(attempts.map(a => () => dispatch(a, `${runDir}/round-1/${a.label}`, null, 'Round 1')))).filter(Boolean)
 if (!r1.length) return { error: 'all round-1 attempts failed (dispatch errors)' }
