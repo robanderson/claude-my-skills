@@ -1,6 +1,6 @@
 {
   "skill_name": "farnsworth-loop",
-  "note": "Should-trigger / should-not-trigger queries for tuning activation. Triggers: the sigil '@@FL:N:M' (preferred) or the prose marker 'farnsworth loop:N[:2]', case-insensitive with optional spaces. N = attempts/round, M/P = passes (omitted or 1 = single, 2 = two pass). 'mode' is the expected mode for should_trigger cases. Non-triggers are genuine non-tournaments or other tournament phrasings that belong to the separate best-of-n skill, not this explicitly-named one.",
+  "note": "Should-trigger / should-not-trigger queries for tuning activation. Triggers: the sigil '@@FL[:N][:M[:Z]]' (preferred) or the prose marker 'farnsworth loop:N[:M[:Z]]', case-insensitive with optional spaces. N = attempts/round (optional; inferable from a prose model spec or the Top Mixed preset), M = passes (1 single, 2 two), Z = grand loops (Z>1 not yet implemented, inert). 'mode' is the expected mode; n/assignment/z/needsGate/conflict/error/preset are expected fl-parse.mjs outputs where relevant. Non-triggers are genuine non-tournaments or other tournament phrasings that belong to the separate best-of-n skill, not this explicitly-named one.",
   "queries": [
     {"query": "do abc @@FL:5", "should_trigger": true, "mode": "single"},
     {"query": "do abc @@FL:5:2", "should_trigger": true, "mode": "two"},
@@ -24,6 +24,27 @@
     {"query": "set up a two-stage build pipeline in CI", "should_trigger": false},
     {"query": "compare Opus and Sonnet on a coding task", "should_trigger": false},
     {"query": "give me one strong solution, no tournament", "should_trigger": false},
-    {"query": "what is the Farnsworth lens in photography?", "should_trigger": false}
+    {"query": "what is the Farnsworth lens in photography?", "should_trigger": false},
+
+    {"query": "do abc @@FL", "should_trigger": true, "mode": "single", "z": 1, "n": null, "needsGate": true, "comment": "bare @@FL -> interactive gate"},
+    {"query": "build a parser with 2 opus, 2 glm 5.2, 1 codex high @@FL", "should_trigger": true, "mode": "single", "z": 1, "n": 5, "assignment": ["opus","opus","glm-5.2","glm-5.2","codex-high"], "comment": "headline prose spec"},
+    {"query": "do abc, 1 opus and 1 sonnet and 1 codex farnsworth loop:3", "should_trigger": true, "mode": "single", "z": 1, "n": 3, "assignment": ["opus","sonnet","codex-medium"], "comment": "bare codex -> medium default"},
+    {"query": "do x with 3 glm @@FL", "should_trigger": true, "mode": "single", "z": 1, "n": 3, "assignment": ["glm-5.2","glm-5.2","glm-5.2"], "comment": "bare glm -> glm-5.2 default"},
+    {"query": "do y with 2 minimax @@FL", "should_trigger": true, "mode": "single", "z": 1, "n": 2, "assignment": ["minimax-m3","minimax-m3"], "comment": "minimax provider token"},
+    {"query": "do abc top mixed @@FL:6", "should_trigger": true, "mode": "single", "z": 1, "n": 6, "preset": "top-mixed", "assignment": ["opus","opus","glm-5.2","glm-5.2","codex-high","codex-high"], "comment": "Top Mixed N=6 -> 2/2/2"},
+    {"query": "do abc 5 top mixed @@FL", "should_trigger": true, "mode": "single", "z": 1, "n": 5, "preset": "top-mixed", "assignment": ["opus","opus","glm-5.2","glm-5.2","codex-high"], "comment": "Top Mixed leading-count N=5 -> 2/2/1"},
+    {"query": "do abc with top-mix @@FL:2", "should_trigger": true, "mode": "single", "z": 1, "n": 2, "preset": "top-mixed", "assignment": ["opus","glm-5.2"], "comment": "Top Mixed N=2 -> opus+glm-5.2"},
+    {"query": "improve X @@FL:4 with 2 opus, 2 glm, 1 codex", "should_trigger": true, "mode": "single", "z": 1, "n": null, "conflict": {"markerN": 4, "specN": 5}, "comment": "explicit-N-vs-prose conflict -> stop & ask"},
+    {"query": "do x with 2 opus and 1 sonnet @@FL:3", "should_trigger": true, "mode": "single", "z": 1, "n": 3, "assignment": ["opus","opus","sonnet"], "comment": "marker N and spec agree"},
+    {"query": "do abc @@FL:5:1:3", "should_trigger": true, "mode": "single", "z": 3, "error": "grand loops not yet implemented"},
+    {"query": "do abc @@FL:5:2:2", "should_trigger": true, "mode": "two", "z": 2, "error": "grand loops not yet implemented"},
+    {"query": "do abc @@FL:5::3", "should_trigger": true, "error": "positional skip", "comment": "positional skip forbidden; require @@FL:5:1:3"},
+    {"query": "fix 3 bugs @@FL:5", "should_trigger": true, "mode": "single", "z": 1, "n": 5, "assignment": null, "needsGate": true, "comment": "digit-noun guard: '3 bugs' is task text, n stays 5"},
+    {"query": "write 5 tests for the parser @@FL:4", "should_trigger": true, "mode": "single", "z": 1, "n": 4, "assignment": null, "needsGate": true, "comment": "digit-noun guard"},
+    {"query": "refactor 2 modules with 2 opus @@FL:2", "should_trigger": true, "mode": "single", "z": 1, "n": 2, "assignment": ["opus","opus"], "comment": "'2 modules' task text ignored; '2 opus' is the spec"},
+    {"query": "do x with 2 opus and 1 gpt4 @@FL", "should_trigger": true, "mode": "single", "z": 1, "n": null, "error": "Unrecognised model token", "comment": "unknown token rejected loudly, never dropped"},
+    {"query": "fix 3 bugs in the parser", "should_trigger": false, "comment": "no marker; ordinary digit-noun task must NOT trigger"},
+    {"query": "compare 2 opus and 1 sonnet runs side by side", "should_trigger": false, "comment": "a prose spec alone (no marker) does not trigger"},
+    {"query": "run the top mixed playlist on shuffle", "should_trigger": false, "comment": "'top mixed' without a marker is not a tournament"}
   ]
 }

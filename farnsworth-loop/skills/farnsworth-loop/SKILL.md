@@ -1,6 +1,6 @@
 ---
 name: farnsworth-loop
-description: "Run a Farnsworth Loop tournament in one of two modes. First ask the user which model quality to use for the attempts (Anthropic Opus, Sonnet, Haiku; a GLM z.ai model via the glm CLI; a free local on-device MLX model via the omlx server; or Mixed per-attempt). SINGLE PASS: produce N independent solutions in parallel, then a blind Opus reviewer scores them, lists pros and cons, ranks them, and names a winner. TWO PASS: the same first round, but the Opus reviewer also distils what worked and what failed into guidance; the losing attempts are discarded, a second round of N fresh attempts is run with that guidance (positives to emulate, pitfalls to avoid), the saved round one winner is added back, and a final Opus ranker picks the overall winner. Trigger whenever the user's message contains a sigil of the form @@FL:N:M (for example @@FL:5 , @@FL:5:2 , @@fl:7:2 ), where N is the number of attempts per round and M is the number of passes (omitted or 1 = single pass, 2 = two pass); the text before the sigil is the task. ALSO trigger on the prose marker 'farnsworth loop:N' (single pass) or 'farnsworth loop:N:2' (two pass), e.g. 'do abc :farnsworth loop:5' or 'do abc: farnsworth loop:5:2'. All forms are case-insensitive with optional spaces around the colons. Also trigger when the user clearly asks for a farnsworth loop / generate-and-rank tournament even without a marker."
+description: "Run a Farnsworth Loop tournament in one of two modes. The sigil is @@FL[:N][:M[:Z]] — N (optional) = attempts per round, M = passes (1 single, 2 two), Z = grand loops (Z>1 not yet implemented); N may be inferred from a prose model spec like '2 opus, 2 glm 5.2, 1 codex high' (sum of counts = N, the items become the per-attempt Mixed assignment) or the Top Mixed preset ('top mixed' + N spread over opus/glm-5.2/codex-high), and bare @@FL falls back to the interactive model gate. First ask the user which model quality to use for the attempts (Anthropic Opus, Sonnet, Haiku; a GLM z.ai model via the glm CLI; a free local on-device MLX model via the omlx server; or Mixed per-attempt). SINGLE PASS: produce N independent solutions in parallel, then a blind Opus reviewer scores them, lists pros and cons, ranks them, and names a winner. TWO PASS: the same first round, but the Opus reviewer also distils what worked and what failed into guidance; the losing attempts are discarded, a second round of N fresh attempts is run with that guidance (positives to emulate, pitfalls to avoid), the saved round one winner is added back, and a final Opus ranker picks the overall winner. Trigger whenever the user's message contains a sigil of the form @@FL:N:M (for example @@FL:5 , @@FL:5:2 , @@fl:7:2 ), where N is the number of attempts per round and M is the number of passes (omitted or 1 = single pass, 2 = two pass); the text before the sigil is the task. ALSO trigger on the prose marker 'farnsworth loop:N' (single pass) or 'farnsworth loop:N:2' (two pass), e.g. 'do abc :farnsworth loop:5' or 'do abc: farnsworth loop:5:2'. All forms are case-insensitive with optional spaces around the colons. Also trigger when the user clearly asks for a farnsworth loop / generate-and-rank tournament even without a marker."
 ---
 
 # Farnsworth Loop
@@ -24,50 +24,57 @@ This gate is mandatory **even when the environment cannot truly run separate-mod
 
 ## Phase 0: Parse the invocation and detect the mode
 
-The trigger is a task plus a marker in one of two equivalent forms:
+Do not hand-parse the sigil. In Phase 0, run the bundled parser ONCE and act on its JSON:
 
-- **Sigil (preferred):** `@@FL:N:M` — e.g. `@@FL:5`, `@@FL:5:2`, `@@fl:7:2`. `N` = attempts per round, `M` = passes (omitted or `1` = single, `2` = two pass).
-- **Prose marker:** `farnsworth loop:N` or `farnsworth loop:N:P`, optionally with a leading colon (e.g. `... :farnsworth loop:5`, `...: farnsworth loop:5:2`).
+```
+node <plugin-root>/bin/fl-parse.mjs "<the raw user message, verbatim>"
+```
 
-Both are case-insensitive with optional spaces around the colons; the text **before** the marker/sigil is the task. Parse three things:
+It returns `{ task, n, mode, z, assignment, preset?, conflict?, errors?, needsGate? }`. The grammar it implements:
 
-- **Task.** Everything before the marker/sigil. Treat it verbatim, stripping any trailing separator colon (so `do abc:` and `do abc :` both yield the task `do abc`). Every attempt in every round receives the identical task, so the comparison stays fair.
-- **N.** The first integer of the marker (`@@FL:`**N**`:M` or `farnsworth loop:`**N**) — independent attempts **per round**.
-- **Mode.** Decided by the optional **second** integer (M / P, the pass count):
-  - no second segment, or `:1` → **single pass**.
-  - `:2` → **two pass**.
-  - any other value → invalid; ask the user to clarify (only single and two pass exist).
+- **Sigil** `@@FL[:N][:M[:Z]]` (case-insensitive, optional spaces around colons). N optional (int ≥ 2). M optional, default 1 (1 = single, 2 = two pass; any other value → error). Z optional, default 1 (int ≥ 1; Z>1 → "grand loops not yet implemented", inert). `@@FL:5` and `@@FL:5:2` parse exactly as before.
+- **Positional skips are forbidden:** `@@FL:5::3` is invalid; to set Z with a default M, write `@@FL:5:1:3`.
+- **Prose marker** `farnsworth loop:N[:M[:Z]]` — extended identically.
+- **Prose model spec** (may replace explicit N): a comma- or `and`-separated list of `<count> <model>` items anywhere in the message. Sum of counts = N; the items expand to the per-attempt assignment. The spec text is stripped from the task. An ordinary `<digit> <noun>` in the task (e.g. "fix 3 bugs") is NOT a spec.
+- **Top Mixed preset:** `top mixed` (also `top-mix` / `top mix`) plus an N (from the sigil, or a leading count like `6 top mixed`) → allocate N across `[opus, glm-5.2, codex-high]` as evenly as possible (remainder priority opus > glm-5.2 > codex-high; N=2 → opus+glm-5.2).
 
-If the user clearly describes the loop's generate-and-rank tournament but omits any marker, you may still run it: infer single vs two pass from whether they describe a learning round, ask for N and the model if not given, then proceed. Do not nudge the user toward two pass when single pass is what was asked.
+**Act on the JSON, in this order:**
 
-**Examples:**
-- Input: `do abc @@FL:5` → task = "do abc", N = 5, mode = **single pass** (5 attempts, 1 Opus review).
-- Input: `do abc @@FL:5:2` (or `do abc: farnsworth loop:5:2`) → task = "do abc", N = 5, mode = **two pass** (5 + 5 attempts plus 1 carried-over winner = 11 candidates touched).
-- Input: `make a hangman game @@fl:7:2` → task = "make a hangman game", N = 7, mode = **two pass**.
-- Input: `write a python program for hangman game, farnsworth loop:4` → task = "write a python program for hangman game", N = 4, mode = **single pass**.
+1. **`errors` non-empty → STOP and ask.** Print the error(s) and do nothing else. This covers: an unrecognised model token (never silently drop one — a dropped token changes N), an invalid M or Z, a positional skip, N < 2, and the Z>1 "grand loops not yet implemented" stop. `n` and `assignment` are nulled on any error, so never run a tournament when `errors` is present.
+2. **`conflict` present → STOP and ask, surfacing BOTH numbers.** The sigil/marker N and the prose-spec sum disagree. Do **not** guess. Ask, e.g.: *"Your spec lists N=`conflict.specN` (`assignment`) but the marker says N=`conflict.markerN`. Run the spec's count, or N=markerN (and I'll ask the per-attempt models)?"* Proceed only after the user resolves it.
+3. **`needsGate: true` → run the Phase 1 gate.** This is bare `@@FL` (no N, no spec), or Top Mixed with no N anywhere. Go to Phase 1.
+4. **Otherwise (`n` set):** the invocation is complete. If `assignment` is set (a prose spec or Top Mixed already answered the model question), **skip the Phase 1 menu** and use that assignment directly — it *is* a Mixed assignment. If `assignment` is null but `n` is set (explicit N, no spec), run the Phase 1 gate as today.
 
-Validate N before continuing:
+**Task** = the parser's `task` (everything before the marker, with the spec text and Top Mixed keyword stripped and any trailing separator colon removed). Every attempt in every round receives this identical task.
+
+If the user clearly describes the loop's generate-and-rank tournament but omits any marker, you may still run it: infer single vs two pass from whether they describe a learning round, ask for N and the model if not given, then proceed.
+
+Validate before continuing (the parser enforces these; re-check):
 - N must be an integer of 2 or more.
 - Single pass is roughly N attempts plus one Opus pass. At N of 8 or more, confirm the user wants that volume.
 - Two pass roughly doubles the attempt count, so its cost ceiling is lower: at N of 6 or more, confirm the user wants that volume before proceeding (see the cost note in Phase 2).
 
 ## Phase 1: Choose the models (mandatory gate, stop here — both modes)
 
-This is the gate from the operating rule. Ask it as your first response to the trigger and **wait for the answer before doing anything else**. Ask exactly this, as a seven option selection, then stop:
+This is the gate from the operating rule (run it when Phase 0 returned `needsGate`, or when an explicit N has no inferred assignment — when Phase 0 already produced an `assignment`, skip the menu). Ask it as your first response and **wait for the answer before doing anything else**. N defaults to **6** (or whatever Phase 0 supplied); passes default to **2** (or 1). Ask exactly this, as a nine option selection, then stop:
 
-> Which quality of sub-agent do you want for the attempts?
-> 1. Opus — Anthropic, highest capability
-> 2. Sonnet — Anthropic, balanced
-> 3. Haiku — Anthropic, fastest and cheapest
-> 4. GLM — z.ai models (I'll then ask which GLM model)
-> 5. Local — free on-device MLX models via the omlx server (I'll then list the available ones)
-> 6. Codex — OpenAI gpt-5.5 via the `codex exec` CLI (I'll then ask which reasoning effort)
-> 7. Mixed — choose a model per attempt (Anthropic, GLM, Local, or Codex)
+> Which models do you want for the attempts? (N defaults to 6, passes to 2)
+> 1. Top Mixed — spread N across Opus, glm-5.2, codex-high (even split)
+> 2. Specify Mix — choose a model per attempt (custom)
+> 3. Opus — Anthropic, highest capability
+> 4. Sonnet — Anthropic, balanced
+> 5. Haiku — Anthropic, fastest and cheapest
+> 6. GLM — z.ai models (I'll then ask which GLM model)
+> 7. Local — free on-device MLX models via the omlx server (I'll then list the available ones)
+> 8. Codex — OpenAI gpt-5.5 via the `codex exec` CLI (I'll then ask which reasoning effort)
+> 9. MiniMax — minimax-m3 via the bundled minimax runner
 
-Handle the answer:
+Handle the answer (if Phase 0 already produced an `assignment` — a prose spec or the Top Mixed keyword — skip this menu and use it directly):
 
-- **Options 1, 2, or 3 (uniform Anthropic):** every attempt uses that single Anthropic model. Record the assignment, e.g. for N = 4 with Sonnet: `[sonnet, sonnet, sonnet, sonnet]`.
-- **Option 4 (GLM):** drill down with a second question, then stop again and wait. Every attempt uses the one chosen GLM model:
+- **Option 1 (Top Mixed):** if N is not yet known, ask for it. Allocate N across `[opus, glm-5.2, codex-high]` as evenly as possible (remainder priority opus > glm-5.2 > codex-high; N=2 → `[opus, glm-5.2]`) — the same computation `fl-parse.mjs` does for the `top mixed` keyword. Record it, e.g. N = 5 → `[opus, opus, glm-5.2, glm-5.2, codex-high]`.
+- **Option 2 (Specify Mix):** walk the attempts one at a time, attempt 1 to attempt N. For each, ask which concrete model to use, offering the three Anthropic models, the four GLM models, the live local model ids, the four codex effort levels, **and minimax-m3** — not the group names. Record each choice, e.g. `[opus, glm-5.2, codex-high, minimax-m3]`.
+- **Options 3, 4, or 5 (uniform Anthropic):** every attempt uses that single Anthropic model. Record the assignment, e.g. for N = 4 with Sonnet: `[sonnet, sonnet, sonnet, sonnet]`.
+- **Option 6 (GLM):** drill down with a second question, then stop again and wait. Every attempt uses the one chosen GLM model:
   > Which GLM model?
   > 1. glm-5.2 — strongest, 1M context
   > 2. glm-5.1
@@ -75,8 +82,8 @@ Handle the answer:
   > 4. glm-4.5-air — fastest, cheapest
 
   Record the uniform assignment, e.g. for N = 4 with glm-5.2: `[glm-5.2, glm-5.2, glm-5.2, glm-5.2]`.
-- **Option 5 (Local):** the local model list is **dynamic**, so fetch it live before drilling down — run `omlx-models` (or `curl -s http://127.0.0.1:8000/v1/models -H "Authorization: Bearer $OMLX_AUTH_TOKEN" | jq -r '.data[].id'`). Present the returned model ids as a numbered menu, then stop and wait. Every attempt uses the one chosen local model id (recorded verbatim, e.g. `[gemma-4-26b-a4b-it-8bit, ...]`). If the server is unreachable (connection refused), tell the user the local server appears down and offer another tier. Local models are free but slower; flag that for larger N.
-- **Option 6 (Codex):** Codex is pinned to OpenAI **gpt-5.5** (the model the local ChatGPT-account auth serves; other ids need an `OPENAI_API_KEY`), so the submenu is the **reasoning effort** (codex's quality lever), not a model. First run a one-line liveness probe so a stale CLI / auth block doesn't waste a (possibly paid) round:
+- **Option 7 (Local):** the local model list is **dynamic**, so fetch it live before drilling down — run `omlx-models` (or `curl -s http://127.0.0.1:8000/v1/models -H "Authorization: Bearer $OMLX_AUTH_TOKEN" | jq -r '.data[].id'`). Present the returned model ids as a numbered menu, then stop and wait. Every attempt uses the one chosen local model id (recorded verbatim, e.g. `[gemma-4-26b-a4b-it-8bit, ...]`). If the server is unreachable (connection refused), tell the user the local server appears down and offer another tier. Local models are free but slower; flag that for larger N.
+- **Option 8 (Codex):** Codex is pinned to OpenAI **gpt-5.5** (the model the local ChatGPT-account auth serves; other ids need an `OPENAI_API_KEY`), so the submenu is the **reasoning effort** (codex's quality lever), not a model. First run a one-line liveness probe so a stale CLI / auth block doesn't waste a (possibly paid) round:
   > `printf 'reply OK and stop' | codex exec -s read-only --skip-git-repo-check -c 'mcp_servers={}' -m gpt-5.5 - 2>&1 | tail -5`
 
   If it returns an HTTP 400 "requires a newer version of Codex" → tell the user to `brew upgrade codex`; if "not supported when using Codex with a ChatGPT account" → tell them to set `OPENAI_API_KEY` (API-key billing) — then offer another tier. On success (it prints OK), ask:
@@ -87,9 +94,9 @@ Handle the answer:
   > 4. Extra high — maximum reasoning depth
 
   Record the uniform assignment using the `codex-<effort>` displayModel (effort token: low / medium / high / **xhigh** for "Extra high"), e.g. for N = 4 at High: `[codex-high, codex-high, codex-high, codex-high]`. Codex bills your OpenAI/ChatGPT plan, not Anthropic usage; flag that codex (an autonomous agent with no turn cap) is slower than a one-shot, so size N modestly.
-- **Option 7 (Mixed):** walk through the attempts one at a time, attempt 1 to attempt N. For each, ask which concrete model to use, offering the three Anthropic models, the four GLM models, the live local model ids, **and** the four codex effort levels (Opus, Sonnet, Haiku, glm-5.2, glm-5.1, glm-4.7, glm-4.5-air, the `omlx-models` ids, plus codex-low/codex-medium/codex-high/codex-xhigh) — not the group names and not "Mixed" again. Record each choice, e.g. `[opus, glm-5.2, codex-high, gemma-4-26b-a4b-it-8bit]`.
+- **Option 9 (MiniMax):** every attempt uses `minimax-m3`, dispatched via the bundled `bin/minimax-run.sh` through the `farnsworth-loop:farnsworth-minimax` agent. Record the uniform assignment, e.g. for N = 4: `[minimax-m3, minimax-m3, minimax-m3, minimax-m3]`. Treat it like the other single-model runner providers (its own `_minimax_run.log` provenance marker, same honest-failure handling). MiniMax-M3 is fast on lighter tasks but, like GLM, can be slow on heavy multi-file builds — size the wall-clock accordingly.
 
-In two pass, the model assignment applies to **both rounds**: round two re-uses the same per-attempt list. If the user explicitly wants different models for round two, re-ask the gate for round two; otherwise re-use round one's assignment. Model aliases, the GLM/local dispatch mechanics, and the `--model` mappings are in `references/orchestration.md`. **Anthropic attempts dispatch via the Task tool; GLM attempts via the `glm`→z.ai runner; Local attempts via the `omlx`→on-device runner; Codex attempts via the `codex exec` runner** (the non-Anthropic ones through bundled wrapper agents, per the orchestration reference). The reviewer and the final ranker are **always Anthropic Opus**, regardless of what the attempts use — the judge is held fixed so the comparison is consistent.
+In two pass, the model assignment applies to **both rounds**: round two re-uses the same per-attempt list. If the user explicitly wants different models for round two, re-ask the gate for round two; otherwise re-use round one's assignment. Model aliases, the GLM/local dispatch mechanics, and the `--model` mappings are in `references/orchestration.md`. **Anthropic attempts dispatch via the Task tool; GLM attempts via the `glm`→z.ai runner; Local attempts via the `omlx`→on-device runner; Codex attempts via the `codex exec` runner; MiniMax attempts via the `bin/minimax-run.sh` runner (agent `farnsworth-loop:farnsworth-minimax`)** (the non-Anthropic ones through bundled wrapper agents, per the orchestration reference). The reviewer and the final ranker are **always Anthropic Opus**, regardless of what the attempts use — the judge is held fixed so the comparison is consistent.
 
 ## Phase 1b: Diversity injection (default on — both modes)
 
@@ -167,7 +174,7 @@ Include brief run metadata: the mode, N, the model per attempt, the diversity mo
 
 | Step | Single pass | Two pass |
 |------|-------------|----------|
-| Trigger | `@@FL:N` / `farnsworth loop:N` | `@@FL:N:2` / `farnsworth loop:N:2` |
+| Trigger | `@@FL[:N][:M[:Z]]` / `farnsworth loop:N[:M[:Z]]` — N optional (prose spec / Top Mixed can supply it) | same, `:2` = two pass |
 | Phase 0 | parse task, N, mode | parse task, N, mode |
 | Phase 1 | model gate (mandatory stop) | model gate (mandatory stop) |
 | Phase 1b | diversity injection (default on) | diversity injection (default on) |
@@ -177,10 +184,10 @@ Include brief run metadata: the mode, N, the model per attempt, the diversity mo
 | Phase 5 | — | final pool = N round-2 + 1 saved winner; blind Opus rank |
 | Phase 6 | report | report (+ guidance used, winner's round) |
 
-- Trigger: sigil `@@FL:N:M` (preferred — e.g. `@@FL:5`, `@@FL:7:2`, `@@fl:4:2`) or prose `farnsworth loop:N[:2]`. N = attempts/round, M = passes (omit/1 = single, 2 = two). Case-insensitive, optional spaces; text before the marker is the task.
-- Dispatch: prefer the bundled `Workflow` script `workflows/tournament.mjs` (live in `/workflows`); Anthropic attempts native, GLM/Local/Codex attempts via the `farnsworth-glm-*` / `farnsworth-local` / `farnsworth-codex` wrapper agents. Fallback: Task tool + `glm` CLI. See `references/orchestration.md`.
+- Trigger: sigil `@@FL[:N][:M[:Z]]` (e.g. `@@FL:5`, `@@FL:7:2`, bare `@@FL`) or prose `farnsworth loop:N[:M[:Z]]`. N optional — inferable from a prose model spec (`2 opus, 2 glm 5.2, 1 codex high` → N=5, `[opus,opus,glm-5.2,glm-5.2,codex-high]`) or the Top Mixed preset (`top mixed` + N → even split over opus/glm-5.2/codex-high). M = passes (omit/1 single, 2 two). Z = grand loops (Z>1 not yet implemented, inert). Bare `@@FL` → interactive gate. Case-insensitive, optional spaces; text before the marker is the task. Phase 0 runs `bin/fl-parse.mjs` for all of this.
+- Dispatch: prefer the bundled `Workflow` script `workflows/tournament.mjs` (live in `/workflows`); Anthropic attempts native, GLM/Local/Codex/MiniMax attempts via the `farnsworth-glm-*` / `farnsworth-local` / `farnsworth-codex` / `farnsworth-minimax` wrapper agents. Fallback: Task tool + `glm` CLI. See `references/orchestration.md`.
 - N is per round, an integer of 2 or more. Confirm volume at N ≥ 8 (single pass) or N ≥ 6 (two pass).
-- Phase 1 model question: seven options (Opus, Sonnet, Haiku, GLM→submenu, Local→live submenu, Codex→effort submenu, Mixed); GLM drills down to one of glm-5.2/glm-5.1/glm-4.7/glm-4.5-air; Local lists `omlx-models` live (dynamic); Codex is gpt-5.5 with a reasoning-effort submenu (codex-low/medium/high/xhigh); Mixed loops per attempt over Anthropic + GLM + local + codex ids; in two pass the assignment applies to both rounds. Anthropic attempts dispatch via the Task tool, GLM via the `glm`→z.ai runner, Local via the `omlx`→on-device runner, Codex via the `codex exec` runner. Reviewer/ranker are always Anthropic Opus.
+- Phase 1 model question: nine options (Top Mixed, Specify Mix, Opus, Sonnet, Haiku, GLM→submenu, Local→live submenu, Codex→effort submenu, MiniMax); a Phase-0 prose spec or Top Mixed keyword answers it and the menu is skipped; N defaults 6, passes default 2. GLM drills down to one of glm-5.2/glm-5.1/glm-4.7/glm-4.5-air; Local lists `omlx-models` live (dynamic); Codex is gpt-5.5 with a reasoning-effort submenu (codex-low/medium/high/xhigh); Specify Mix loops per attempt over Anthropic + GLM + local + codex + minimax-m3 ids; in two pass the assignment applies to both rounds. Anthropic attempts dispatch via the Task tool, GLM via the `glm`→z.ai runner, Local via the `omlx`→on-device runner, Codex via the `codex exec` runner, MiniMax via the `bin/minimax-run.sh` runner. Reviewer/ranker are always Anthropic Opus.
 - Diversity injection (default on): each attempt draws a distinct framing so siblings do not converge. Pool A approach nudges by default (blind-safe); Pool B objective lenses opt-in. Without replacement, seeded, logged. See `references/diversity-injection.md`.
 - Round attempts: N parallel, isolated, identical brief plus one diversity modifier, no cross-talk.
 - Review/rank (Opus, blind): pros and cons per candidate, rank, name winner. In two pass also distil positives-to-consider and challenges-to-avoid, save the winner, discard the other artifacts.
