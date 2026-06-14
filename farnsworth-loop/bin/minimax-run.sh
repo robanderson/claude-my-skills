@@ -11,13 +11,11 @@ LOG=_minimax_run.log
 TIMEOUT="${FL_TIMEOUT_SECS:-300}"   # wall-clock backstop (seconds)
 MAXTURNS="${FL_MAX_TURNS:-30}"       # primary guard: cap agentic iterations (single-pass)
 
-# Resolve the MiniMax API key: prefer the env var; fall back to the user's ~/.zshrc export
-# (non-interactive tool shells source .zshenv, not .zshrc, so the env var is often absent).
-KEY="${MINIMAX_API_KEY:-}"
-if [ -z "$KEY" ] && [ -f "$HOME/.zshrc" ]; then
-  KEY=$(grep -E '^[[:space:]]*export[[:space:]]+MINIMAX_API_KEY=' "$HOME/.zshrc" | tail -1 | sed -E 's/^[^=]*=//; s/^["'"'"']//; s/["'"'"']$//')
-fi
-if [ -z "$KEY" ]; then echo "FARNSWORTH-MINIMAX-ERROR MINIMAX_API_KEY missing (set it or export in ~/.zshrc)" | tee -a "$LOG"; exit 3; fi
+# MINIMAX_API_KEY comes from the environment — exactly like glm-run.sh reads ZAI_API_KEY. The user's
+# ~/.zshrc exports it (alongside ZAI_API_KEY / OMLX_AUTH_TOKEN) and the Claude Code session inherits it
+# at launch. If it is missing, the session predates the export: relaunch from a shell that has it. Do
+# NOT add bespoke key-loading (sourcing/grepping rc files) here — keep every provider runner uniform.
+if [ -z "${MINIMAX_API_KEY:-}" ]; then echo "FARNSWORTH-MINIMAX-ERROR MINIMAX_API_KEY missing (export in ~/.zshrc and relaunch)" | tee -a "$LOG"; exit 3; fi
 [ -f _brief.txt ] || { echo "FARNSWORTH-MINIMAX-ERROR _brief.txt missing" | tee -a "$LOG"; exit 4; }
 
 echo "FARNSWORTH-MINIMAX-PROVENANCE endpoint=api.minimax.io model=MiniMax-M3 max-turns=${MAXTURNS} timeout=${TIMEOUT}s" >> "$LOG"
@@ -26,7 +24,7 @@ echo "FARNSWORTH-MINIMAX-PROVENANCE endpoint=api.minimax.io model=MiniMax-M3 max
 # "no stdin data received in 3s" and can STALL the entire wall-clock producing nothing (the bug that
 # hit glm/codex). Close stdin here and never rely on the caller. (Mirrors glm-run.sh / codex-run.sh.)
 ANTHROPIC_BASE_URL="https://api.minimax.io/anthropic" \
-ANTHROPIC_AUTH_TOKEN="$KEY" \
+ANTHROPIC_AUTH_TOKEN="$MINIMAX_API_KEY" \
 ANTHROPIC_MODEL="MiniMax-M3" \
 ANTHROPIC_DEFAULT_OPUS_MODEL="MiniMax-M3" \
 ANTHROPIC_DEFAULT_SONNET_MODEL="MiniMax-M3" \

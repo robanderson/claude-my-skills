@@ -99,11 +99,15 @@ const localMaxTurns = Number(A.localMaxTurns) > 0 ? Math.floor(Number(A.localMax
 // MiniMax exposes one model (MiniMax-M3); its runner reuses the GLM-style guards (default to glmMaxTurns).
 const minimaxMaxTurns = Number(A.minimaxMaxTurns) > 0 ? Math.floor(Number(A.minimaxMaxTurns)) : glmMaxTurns
 const attemptTimeout = Number(A.attemptTimeoutSecs) > 0 ? Math.floor(Number(A.attemptTimeoutSecs)) : 300
+// GLM via z.ai is slow on heavy multi-file builds — give it its OWN wall-clock (usually larger),
+// independent of local/minimax, so one long GLM leg doesn't force everyone's timeout up. For code-build
+// tournaments pass glmTimeoutSecs ~1800-2400. Defaults to attemptTimeout when unset (backward-compatible).
+const glmTimeoutSecs = Number(A.glmTimeoutSecs) > 0 ? Math.floor(Number(A.glmTimeoutSecs)) : attemptTimeout
 // Codex exec is agentic with NO turn cap (no --max-turns flag), so the wall-clock timeout is its ONLY
 // per-attempt backstop and gets its own, roomier default. Override via args.codexTimeoutSecs.
 const codexTimeout = Number(A.codexTimeoutSecs) > 0 ? Math.floor(Number(A.codexTimeoutSecs)) : 600
 const cmdHead = (ws, b) => `mkdir -p ${q(ws)} && cd ${q(ws)} && printf '%s' ${q(b)} > _brief.txt`
-const runnerCmd = (runner, flag, ws, b, maxTurns) => `${cmdHead(ws, b)} && FL_MAX_TURNS=${maxTurns} FL_TIMEOUT_SECS=${attemptTimeout} bash ${q(runner)} ${flag}`
+const runnerCmd = (runner, flag, ws, b, maxTurns, timeout = attemptTimeout) => `${cmdHead(ws, b)} && FL_MAX_TURNS=${maxTurns} FL_TIMEOUT_SECS=${timeout} bash ${q(runner)} ${flag}`
 // Codex reuses cmdHead + the runner but overrides the wall-clock with codexTimeout (no FL_MAX_TURNS:
 // codex has no turn cap, and codex-run.sh ignores it).
 const codexRunnerCmd = (runner, flag, ws, b) => `${cmdHead(ws, b)} && FL_TIMEOUT_SECS=${codexTimeout} bash ${q(runner)} ${flag}`
@@ -149,7 +153,7 @@ function dispatch(a, ws, guidance, phaseTitle) {
   if (a.dispatch === 'glm') {
     opts.agentType = nsAgent(a.agentType)
     const flag = GLM_FLAG[a.displayModel]
-    const cmd = glmRunner ? runnerCmd(glmRunner, flag, ws, b, glmMaxTurns) : glmInline(flag, ws, b)
+    const cmd = glmRunner ? runnerCmd(glmRunner, flag, ws, b, glmMaxTurns, glmTimeoutSecs) : glmInline(flag, ws, b)
     prompt = RUNVERBATIM(cmd, ws, '_glm_run.log')
   } else if (a.dispatch === 'local') {
     opts.agentType = nsAgent(a.agentType) // farnsworth-local
