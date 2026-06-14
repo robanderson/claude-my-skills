@@ -28,6 +28,8 @@ The Phase 1 selection maps to these. There are two families with two different d
 
 The `--model opus/sonnet/haiku` aliases resolve to GLM models only because the `glm` wrapper sets `ANTHROPIC_DEFAULT_{OPUS,SONNET,HAIKU}_MODEL` to the GLM strings; they are GLM models, not Anthropic ones. The wrapper requires `ZAI_API_KEY` to be set in the environment (it is sourced from the user's shell profile).
 
+**Local models (on-device MLX via the `omlx` server)** — dispatched by shelling out to `claude` pointed at the local `omlx` server (`http://127.0.0.1:8000`). Unlike GLM's fixed five, the local catalogue is **dynamic** — fetch it at gate time with `omlx-models` (or `curl -s http://127.0.0.1:8000/v1/models -H "Authorization: Bearer $OMLX_AUTH_TOKEN" | jq -r '.data[].id'`). Local model ids are passed straight through: `--model <exact-id>` (e.g. `--model gemma-4-26b-a4b-it-8bit`, `--model mlx-community--Qwen3.6-35B-A3B-8bit`) — no alias table. Because the list is dynamic, **one generic worker agent (`farnsworth-local`) handles every local model**; the exact id rides in the command. The runner needs `OMLX_AUTH_TOKEN`; if it is not in the environment, `bin/local-run.sh` falls back to the user's `~/.zshrc` export. Local models are **free** (on-device) but slower than the hosted providers.
+
 The Phase 3 reviewer (single pass and two pass) and the final ranker (Phase 5, two pass only) are **always Anthropic Opus**, dispatched via the Task tool — never GLM. Holding the judge fixed keeps scoring consistent across attempts and across rounds.
 
 ## Dynamic-workflow dispatch (preferred backend)
@@ -45,7 +47,10 @@ Workflow({ scriptPath: "<plugin-root>/workflows/tournament.mjs", args: <ARGS> })
   task: "<exact task text>",
   mode: "single" | "two",
   runDir: "<absolute run dir>",          // e.g. <plugin>/.runs/<run-id>
-  glmRunner: "<plugin-root>/bin/glm-run.sh",  // REQUIRED if any attempt is GLM (see below)
+  glmRunner: "<plugin-root>/bin/glm-run.sh",      // REQUIRED if any attempt is GLM
+  localRunner: "<plugin-root>/bin/local-run.sh",  // REQUIRED if any attempt is Local
+  attemptMaxTurns: 8,                    // optional cap on agentic iterations (GLM/local); default 8
+  attemptTimeoutSecs: 300,               // optional wall-clock backstop (GLM/local); default 300
   attempts: [                            // one per attempt, length N
     { label: "candidate-1",
       dispatch: "anthropic",             // native, runs in-process
@@ -56,6 +61,12 @@ Workflow({ scriptPath: "<plugin-root>/workflows/tournament.mjs", args: <ARGS> })
       dispatch: "glm",                   // runs via a wrapper agent + the runner script
       agentType: "farnsworth-glm-5-2",   // one of the bundled GLM worker agents
       displayModel: "glm-5.2",
+      r1nudge: "...", r2nudge: "..." },
+    { label: "candidate-3",
+      dispatch: "local",                 // runs via the generic local agent + runner
+      agentType: "farnsworth-local",     // the single bundled local worker agent
+      model: "gemma-4-26b-a4b-it-8bit",  // exact omlx model id -> `--model <id>`
+      displayModel: "gemma-4-26b-a4b-it-8bit",
       r1nudge: "...", r2nudge: "..." }
     // ...
   ]
@@ -72,7 +83,7 @@ Workflow({ scriptPath: "<plugin-root>/workflows/tournament.mjs", args: <ARGS> })
 | glm-4.7 | `farnsworth-glm-4-7` |
 | glm-4.5-air | `farnsworth-glm-4-5-air` |
 
-Anthropic attempts pass `dispatch:"anthropic"` + `model`; the workflow spawns them natively. The workflow blind-labels candidates, the Opus reviewer/ranker **reads and runs each candidate's files** from its workspace (judges never receive model identities), and the script returns `{ round1.mapping, round1.review, guidance?, final.mapping, final.rank, final.winnerRound }` — everything Phase 6 needs to unblind and report.
+Anthropic attempts pass `dispatch:"anthropic"` + `model`; the workflow spawns them natively. GLM attempts pass `dispatch:"glm"` + `agentType` (per the map above) + `displayModel`. **Local attempts** pass `dispatch:"local"` + `agentType:"farnsworth-local"` + `model` (the exact omlx id, also used as `displayModel`). The workflow blind-labels candidates, the Opus reviewer/ranker **reads and runs each candidate's files** from its workspace (judges never receive model identities), and the script returns `{ round1.mapping, round1.review, guidance?, final.mapping, final.rank, final.winnerRound }` — everything Phase 6 needs to unblind and report.
 
 **Why GLM dispatch is shaped this way (learned the hard way):** a subagent inherits the session's Anthropic provider, so `model: glm-5.2` fails (verified: the Anthropic endpoint returns "model … may not exist"). GLM therefore needs a separate `claude`→z.ai process. The workflow can only run bash through a sub-agent, and an LLM wrapper handed a **raw** `claude -p … --model glm-5 …` command proved unreliable in smoke testing: it variously (a) solved the task itself with its own Anthropic model, (b) **refused** on safety grounds ("nested autonomous Claude … external provider … unsafe"), or (c) let the weak inner model bail without saving a file. Fix, in three parts:
 
@@ -82,7 +93,16 @@ Anthropic attempts pass `dispatch:"anthropic"` + `model`; the workflow spawns th
 
 `ZAI_API_KEY` must be set (sourced from the user's shell profile). GLM tokens bill the z.ai plan and don't appear in Anthropic usage, but each attempt still shows as a node in `/workflows`. Note: weaker GLM models (esp. `glm-4.5-air`) are less reliable at actually saving a deliverable; `glm-5`/`glm-5.2` are dependable. The brief explicitly forbids clarifying questions and demands a saved file to mitigate this.
 
-If dynamic workflows are unavailable, use the manual Task-tool + `glm`-CLI fallback below.
+**Local dispatch mirrors GLM**, with three differences: (1) the runner is `bin/local-run.sh` (set z.ai env → set omlx/local env pointing at `http://127.0.0.1:8000`); (2) one generic `farnsworth-local` agent serves every model, with the exact id passed as `--model <id>`; (3) the provenance marker is `FARNSWORTH-LOCAL-PROVENANCE endpoint=127.0.0.1:8000` written to `_local_run.log`. The runner resolves `OMLX_AUTH_TOKEN` from the env or, failing that, from the user's `~/.zshrc` export. Local models are free but slower, and small ones can be unreliable at saving a deliverable — same honest-failure handling as GLM. There is no inline fallback for local; it always uses the runner script.
+
+**Per-attempt guards (two layers).** Both runner scripts bound the nested `claude` call:
+
+1. **`--max-turns` (primary, iteration-based).** Passed from `FL_MAX_TURNS` (workflow `attemptMaxTurns`, default 8). This caps the number of agentic turns, so an attempt that tries to grind the write→run→fix loop (the thing that balloons context to tens of thousands of tokens on local models) is stopped cleanly. Crucially, **the deliverable written before the cap is preserved** — hitting the cap truncates the grind but keeps the best-so-far file (claude prints `Error: Reached max turns (N)` and exits non-zero; the saved file is still graded). 8 is comfortably above a clean single-pass (write + one run + summary ≈ 3-4 turns); lower it (e.g. 4-6) to be stricter, raise it for genuinely multi-step tasks.
+2. **Wall-clock timeout (backstop, time-based).** Portable perl `alarm` → TERM/KILL (macOS has no `timeout`/`gtimeout`), from `FL_TIMEOUT_SECS` (workflow `attemptTimeoutSecs`, default 300s). Catches a *single* hung or pathologically slow turn that `--max-turns` can't (one turn never returning). On fire it logs `FARNSWORTH-{GLM,LOCAL}-TIMEOUT secs=N` and exits 124. Scale to task complexity (~180s small, 300s+ heavier).
+
+Either way a bounded-out attempt is just an honest failure and the round proceeds over the survivors. These cover the runner-based (GLM/local) attempts — native Anthropic attempts have no shell hook, but they are fast and bounded by the single-pass brief. The **single-pass brief is the real fix**; these two are the safety net.
+
+If dynamic workflows are unavailable, use the manual Task-tool + `glm`/`omlx`-CLI fallback below.
 
 ## Run layout
 
@@ -111,10 +131,15 @@ Single pass stops after `review-1/`: the Phase 3 reviewer names the winner and t
 
 Launch all N of a round in the same turn so they run concurrently, each pointed at its own workspace. Single pass dispatches the Round 1 brief only. Two pass dispatches the Round 1 brief, then later the Round 2 brief.
 
+**Each attempt is a SINGLE-PASS exploration, not a grind to perfection.** This is the most important property of the brief, and it is easy to get wrong. The refinement in this system happens at the **tournament** level — many diverse one-shot attempts → blind review → (two pass) distilled guidance → a fresh guided round → final rank — *not* inside any one attempt. So the brief must tell each attempt to produce one solution and stop, explicitly forbidding "iterate until it works":
+- An instruction like "actually run it and iterate until it works" is **harmful** here. It (a) collapses diversity — attempts converge on "whatever runs" instead of exploring different approaches; (b) suppresses the failure signal that the review distils into round-two guidance (a rough or broken attempt is *useful data*, not a wasted slot); and (c) on slow or local models, balloons the context (write→run→read→fix loops) into tens of thousands of tokens, turning a one-minute call into many minutes.
+- Allow at most a single quick sanity run. Require that a file be saved (an empty workspace is a real failure), but make clear it need not be flawless. Ask for an honest note on known limitations — that note feeds the distillation.
+- Keep the no-cross-talk rule: convey "single pass, don't over-polish" as a working style; do **not** tell the attempt it is one of several, that it is being judged, or that failures feed a later round.
+
 **Round 1 brief (identical task plus one diversity modifier) — both modes:**
 
 ```
-You are solving a self-contained task. Produce a complete, working solution.
+You are solving a self-contained task. Produce ONE complete solution in a single focused pass.
 
 Task:
 <the exact task text, verbatim>
@@ -123,39 +148,37 @@ Task:
 "Approach this task test-first: sketch the tests before the implementation.">
 
 Rules:
-- Save all output files to: farnsworth-loop/<run-id>/round-1/candidate-<i>/
-- Work only in that directory.
-- At the end, return: (a) the path(s) to your deliverable, and
-  (b) a 2 to 4 sentence note on your approach and any tradeoffs you made.
+- Fully specified — do NOT ask questions; make reasonable defaults and just produce your solution.
+- SINGLE pass: write it once and stop. Do NOT iterate to perfect it or loop re-running and fixing.
+  A clear, reasonable, possibly-imperfect solution is what is wanted. Run it at most ONCE as a sanity check.
+- Save your solution file(s) to: farnsworth-loop/<run-id>/round-1/candidate-<i>/  (an empty workspace is a failure;
+  the file need NOT be flawless). Work only in that directory.
+- End with a 2 to 4 sentence note on your approach, tradeoffs, and any known limitations.
 ```
 
 **Round 2 brief (two pass only — task plus distilled guidance, no prior code):**
 
 ```
-You are solving a self-contained task. Produce a complete, working solution.
+You are solving a self-contained task. Produce ONE complete solution in a single focused pass.
 
 Task:
 <the exact task text, verbatim>
 
 In producing your answer, please consider these items as possible positives:
-- <positive a>
-- <positive b>
-- <positive c>
-- <positive d>
+- <positive a> ... <positive d>
 And treat these items as challenges to avoid:
-- <challenge w>
-- <challenge x>
-- <challenge y>
-- <challenge z>
+- <challenge w> ... <challenge z>
 
 <one drawn Pool A nudge, per references/diversity-injection.md, e.g.
 "Approach this task starting from the data model or core types.">
 
 Rules:
-- Save all output files to: farnsworth-loop/<run-id>/round-2/candidate-<i>/
-- Work only in that directory.
-- At the end, return: (a) the path(s) to your deliverable, and
-  (b) a 2 to 4 sentence note on your approach and any tradeoffs you made.
+- Fully specified — do NOT ask questions; make reasonable defaults and just produce your solution.
+- SINGLE pass: write it once and stop. Do NOT iterate to perfect it or loop re-running and fixing.
+  Run it at most ONCE as a sanity check.
+- Save your solution file(s) to: farnsworth-loop/<run-id>/round-2/candidate-<i>/  (an empty workspace is a failure;
+  the file need NOT be flawless). Work only in that directory.
+- End with a 2 to 4 sentence note on your approach, tradeoffs, and any known limitations.
 ```
 
 In neither round, and in either mode, tell an agent it is one of several, what N is, that it will be judged, or hand it another agent's output. Each attempt must be an independent solution. The round two guidance steers; it must not include or paraphrase a specific candidate's code, only generic patterns to emulate and pitfalls to avoid.

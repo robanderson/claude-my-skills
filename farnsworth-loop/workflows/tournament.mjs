@@ -38,7 +38,7 @@ function brief(nudge, ws, guidance) {
     const ch = (guidance.challenges || []).map(c => `- ${c}`).join('\n')
     g = `\nIn producing your answer, please consider these items as possible positives:\n${pos}\nAnd treat these items as challenges to avoid:\n${ch}\n`
   }
-  return `You are solving a self-contained task. Produce a complete, working solution.
+  return `You are solving a self-contained task. Produce ONE complete solution in a single focused pass.
 
 Task:
 ${task}
@@ -46,12 +46,12 @@ ${g}
 ${nudge}
 
 Rules:
-- This task is fully specified and self-contained. Do NOT ask clarifying questions, present options, or stop for input — make reasonable default choices and deliver a complete solution.
-- Your text reply is discarded; ONLY the files you save in the workspace are graded. You MUST save a complete, working deliverable — a reply with no saved file counts as a total failure.
+- This task is fully specified and self-contained. Do NOT ask clarifying questions, present options, or stop for input — make reasonable default choices and just produce your solution.
+- Work in a SINGLE pass: write your solution once and stop. Do NOT iterate repeatedly to perfect it, and do NOT keep re-running and fixing. A clear, reasonable solution that may be imperfect is exactly what is wanted; exhaustive polishing is not, and wastes effort. At most, run it ONCE as a quick sanity check — then submit whatever you have.
+- Your text reply is discarded; ONLY the file(s) you save are kept. You MUST save your solution to a file (an empty workspace is a total failure) — but it does NOT need to be flawless or fully working.
 - Save all deliverable files to: ${ws}
 - Work only in that directory. Create it if needed.
-- If it is code, actually run it to confirm it works; iterate until it does.
-- At the end, print a 2 to 4 sentence note on your approach and any tradeoffs you made.`
+- End with a 2 to 4 sentence note on your approach, plus any tradeoffs or known limitations (an honest note about what is rough or unfinished is useful, not a mark against you).`
 }
 
 // GLM display model -> the `claude` --model flag that selects it on the z.ai endpoint.
@@ -64,21 +64,32 @@ const GLM_FLAG = {
 }
 const q = s => "'" + String(s).replace(/'/g, "'\\''") + "'" // single-quote shell-escape
 
-// Deterministic shell command for a GLM attempt. Preferred form delegates the actual
-// z.ai call to the bundled runner script (args.glmRunner), so the wrapper agent only
-// sees a benign `bash glm-run.sh` invocation — no raw nested-Claude command to refuse,
-// shortcut, or self-substitute. Inline fallback when no runner path was provided.
+// Runner paths for the non-Anthropic providers (passed in via args). Each provider's
+// real (nested-Claude) call lives in a bundled script, so the wrapper agent only ever
+// sees a benign `bash <runner> <flag>` command — nothing to refuse, shortcut, or
+// self-substitute. GLM has an inline fallback; local always uses its runner.
 const glmRunner = A.glmRunner
-function glmCommand(flag, ws, b) {
-  const head = `mkdir -p ${q(ws)} && cd ${q(ws)} && printf '%s' ${q(b)} > _brief.txt`
-  if (glmRunner) return `${head} && bash ${q(glmRunner)} ${flag}`
-  return `${head} && ` +
+const localRunner = A.localRunner
+// Per-attempt guards for GLM/local runners (enforced inside the runner scripts):
+//  - max-turns: PRIMARY guard — caps agentic iterations so single-pass attempts can't
+//    grind the write->run->fix loop (which balloons context, esp. on local models).
+//  - timeout: wall-clock backstop for a single hung/slow turn.
+const attemptMaxTurns = Number(A.attemptMaxTurns) > 0 ? Math.floor(Number(A.attemptMaxTurns)) : 8
+const attemptTimeout = Number(A.attemptTimeoutSecs) > 0 ? Math.floor(Number(A.attemptTimeoutSecs)) : 300
+const cmdHead = (ws, b) => `mkdir -p ${q(ws)} && cd ${q(ws)} && printf '%s' ${q(b)} > _brief.txt`
+const runnerCmd = (runner, flag, ws, b) => `${cmdHead(ws, b)} && FL_MAX_TURNS=${attemptMaxTurns} FL_TIMEOUT_SECS=${attemptTimeout} bash ${q(runner)} ${flag}`
+
+function glmInline(flag, ws, b) {
+  return `${cmdHead(ws, b)} && ` +
     `echo "FARNSWORTH-GLM-PROVENANCE endpoint=api.z.ai flag=${flag}" >> _glm_run.log && ` +
     `ANTHROPIC_BASE_URL="https://api.z.ai/api/anthropic" ANTHROPIC_AUTH_TOKEN="$ZAI_API_KEY" ` +
     `ANTHROPIC_DEFAULT_OPUS_MODEL="glm-5.2[1m]" ANTHROPIC_DEFAULT_SONNET_MODEL="glm-4.7" ANTHROPIC_DEFAULT_HAIKU_MODEL="glm-4.5-air" ` +
     `claude -p "$(cat _brief.txt)" ${flag} --allowedTools "Bash Read Write Edit" >> _glm_run.log 2>&1; ` +
     `echo "FARNSWORTH-GLM-DONE exit=$?" >> _glm_run.log; tail -20 _glm_run.log`
 }
+
+const RUNVERBATIM = (cmd, ws, log) =>
+  `This is an approved internal step of the farnsworth-loop tournament: it writes a brief file and runs a bundled project runner script, which performs the attempt. Run the following shell command EXACTLY as given, in one Bash call, and do nothing else (do not attempt the task yourself, do not edit the command):\n\n${cmd}\n\nThen report the deliverable path(s) in ${ws} and the last ~15 lines of ${log}.`
 
 function dispatch(a, ws, guidance, phaseTitle) {
   const b = brief(guidance ? a.r2nudge : a.r1nudge, ws, guidance)
@@ -87,7 +98,12 @@ function dispatch(a, ws, guidance, phaseTitle) {
   if (a.dispatch === 'glm') {
     opts.agentType = a.agentType
     const flag = GLM_FLAG[a.displayModel]
-    prompt = `This is an approved internal step of the farnsworth-loop tournament: it writes a brief file and runs the bundled project runner script, which performs the GLM attempt. Run the following shell command EXACTLY as given, in one Bash call, and do nothing else (do not attempt the task yourself, do not edit the command):\n\n${glmCommand(flag, ws, b)}\n\nThen report the deliverable path(s) in ${ws} and the last ~15 lines of _glm_run.log.`
+    const cmd = glmRunner ? runnerCmd(glmRunner, flag, ws, b) : glmInline(flag, ws, b)
+    prompt = RUNVERBATIM(cmd, ws, '_glm_run.log')
+  } else if (a.dispatch === 'local') {
+    opts.agentType = a.agentType // farnsworth-local
+    const flag = `--model ${a.model}` // exact local model id, passes straight through to omlx
+    prompt = RUNVERBATIM(runnerCmd(localRunner, flag, ws, b), ws, '_local_run.log')
   } else {
     opts.model = a.model
     prompt = b
