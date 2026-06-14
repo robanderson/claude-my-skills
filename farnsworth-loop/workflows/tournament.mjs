@@ -88,8 +88,9 @@ const runnerCmd = (runner, flag, ws, b, maxTurns) => `${cmdHead(ws, b)} && FL_MA
 // Optional shared CONTEXT BUNDLE for known-input tasks (args.contextFiles = [paths/globs]).
 // Concatenate those files ONCE into a single file that every worker reads by path — instead of
 // each attempt re-reading the same source files (which dominated tool-use/latency in practice).
-// The bundle lives OUTSIDE any candidate workspace and is _-prefixed, so the [!_]* staging glob
-// never exposes it to the blind judge. No bundle is built when contextFiles is empty.
+// The bundle lives OUTSIDE any candidate workspace (in ${runDir}/_context/), and staging only ever
+// copies a candidate's own workspace into its review dir, so the bundle is never exposed to the blind
+// judge. No bundle is built when contextFiles is empty.
 const contextFiles = Array.isArray(A.contextFiles) ? A.contextFiles.filter(Boolean) : []
 const contextPath = contextFiles.length ? `${runDir}/_context/_context.md` : null
 async function buildContext() {
@@ -143,8 +144,8 @@ function dispatch(a, ws, guidance, phaseTitle) {
     .catch(e => { log(`attempt ${a.label} (${a.displayModel}) errored: ${String(e).slice(0, 100)}`); return null }) // don't swallow silently
 }
 
-function judgePrompt(kind, blindList, guidanceWanted) {
-  const items = blindList.map(c => `- Candidate ${c.blind}: deliverable(s) in directory ${c.ws}`).join('\n')
+function judgePrompt(kind, blindList, guidanceWanted, poolPath) {
+  const dirs = blindList.map(c => `  Candidate ${c.blind}: ${c.ws}/`).join('\n')
   const guidanceBlock = guidanceWanted
     ? `\n\nAlso distil GUIDANCE for a second round of fresh attempts. Two short generic lists, NO candidate-specific code:\n- positives: patterns/choices that worked anywhere this round.\n- challenges: pitfalls/weaknesses/constraint-violations seen anywhere this round.`
     : ''
@@ -153,8 +154,12 @@ function judgePrompt(kind, blindList, guidanceWanted) {
 Task that every candidate was given:
 ${task}
 
-Candidates (each directory below contains ONLY that candidate's deliverable file(s) — read them; if it is runnable code, you may run it with a sensible timeout to see the real output, and judge the real output — not any self-summary):
-${items}
+All candidate deliverables are concatenated, blind-labelled, in ONE file — read it ONCE (each candidate's section is headed "===== Candidate <letter> ====="):
+${poolPath}
+
+If (and only if) a candidate is runnable code you want to execute to judge the real output, its individual files are in its own directory (run with a sensible timeout):
+${dirs}
+Judge the real output / artifact — not any self-summary. Do not read any other files.
 
 Score each candidate against criteria suited to the task (for code: correctness, meets stated constraints, completeness, edge cases, readability; adapt for non-code). Give concrete, specific pros and cons per candidate. Rank them all. Name the single winner with reasoning.${guidanceBlock}
 
@@ -204,34 +209,58 @@ const RANK_SCHEMA = {
 }
 
 // ---- helpers ----
-// #1 + #2: stage each candidate's DELIVERABLE-ONLY files (names not starting with '_') into a
-// clean per-blind dir, so the judge never sees provenance logs / briefs (which name the
-// provider/model) or the round-1-vs-round-2 path (which would unmask the carried-over winner).
-// Also report which candidates actually saved a deliverable and (glm/local) a valid provenance
-// marker — so empty/faked attempts are excluded BEFORE judging, not flagged after.
+const STAGE_SCHEMA = {
+  type: 'object', additionalProperties: false,
+  properties: {
+    results: {
+      type: 'array',
+      items: {
+        type: 'object', additionalProperties: false,
+        properties: { blind: { type: 'string' }, deliverable: { type: 'boolean' }, provenance: { type: 'boolean' } },
+        required: ['blind', 'deliverable', 'provenance'],
+      },
+    },
+  },
+  required: ['results'],
+}
+
+// Stage + validate + pool, all from one cheap haiku agent running a DETERMINISTIC shell script:
+//  - stage deliverables into a clean per-blind dir (copy all, then delete the known engine files by
+//    exact name — an allowlist, so a legit `_`-prefixed deliverable like `_config.yml` is NOT dropped) (#6);
+//  - check a deliverable was saved AND (glm/local) the SUCCESS provenance contract holds — PROVENANCE
+//    marker + DONE exit=0 + no TIMEOUT/ERROR (#2);
+//  - concatenate the valid deliverables into ONE blind-labelled pool file the judge reads once (read-cost).
+// The agent returns per-candidate {deliverable, provenance} via a SCHEMA (not scraped prose) (#4), and we
+// FAIL CLOSED (#1): any candidate missing from the return, or not deliverable+provenance, is invalid.
 async function stageAndValidate(list, reviewDir, phaseTitle) {
-  const script = list.map(c => {
+  const pool = `${reviewDir}/_pool.md`
+  const script = [`mkdir -p ${q(reviewDir)}; : > ${q(pool)}`].concat(list.map(c => {
     const dest = `${reviewDir}/${c.blind}`
     const log = c.dispatch === 'glm' ? '_glm_run.log' : c.dispatch === 'local' ? '_local_run.log' : ''
     const lp = log ? q(`${c.ws}/${log}`) : ''
-    // provenance: only fail if a runner log is present but lacks the marker (a carried-over winner
-    // staged from review-1 has no log and was already validated upstream → treat as ok).
-    const provChk = log ? `if [ -f ${lp} ]; then if grep -q FARNSWORTH- ${lp}; then P=1; else P=0; fi; else P=1; fi` : `P=1`
-    return `mkdir -p ${q(dest)}; cp -R ${q(c.ws)}/[!_]* ${q(dest)}/ 2>/dev/null; ` +
-           `D=$(ls -A ${q(dest)} 2>/dev/null | grep -c .); ${provChk}; ` +
+    // FAIL CLOSED (#2): the runner writes its log (with the PROVENANCE line) UNCONDITIONALLY at
+    // startup, so a missing log at this exact path means the runner never ran — a native-solve spoof
+    // or refusal — which must be rejected (P=0), not waved through. Native attempts (no runner) → P=1.
+    const provChk = log
+      ? `if [ -f ${lp} ]; then if grep -q 'FARNSWORTH-.*-PROVENANCE endpoint=' ${lp} && grep -q 'FARNSWORTH-.*-DONE exit=0' ${lp} && ! grep -q 'FARNSWORTH-.*-\\(TIMEOUT\\|ERROR\\)' ${lp}; then P=1; else P=0; fi; else P=0; fi`
+      : `P=1`
+    return `mkdir -p ${q(dest)}; cp -R ${q(c.ws)}/. ${q(dest)}/ 2>/dev/null; ` +
+           `rm -f ${q(dest)}/_brief.txt ${q(dest)}/_glm_run.log ${q(dest)}/_local_run.log; ` +
+           `D=$(find ${q(dest)} -type f 2>/dev/null | grep -c .); ${provChk}; ` +
+           `if [ "$D" -gt 0 ] && [ "$P" -eq 1 ]; then { echo "===== Candidate ${c.blind} ====="; cat ${q(dest)}/* 2>/dev/null; echo; } >> ${q(pool)}; fi; ` +
            `echo "FLV ${c.blind} d=$([ "$D" -gt 0 ] && echo 1 || echo 0) p=$P"`
-  }).join('\n')
-  const out = await agent(
-    `Run this exact shell script in ONE Bash call, then reply with the script's stdout verbatim (the FLV lines) and nothing else — do not summarize or add commentary:\n\n${script}`,
-    { model: 'haiku', phase: phaseTitle, label: 'stage' }
-  ).catch(() => '')
+  })).join('\n')
+  const res = await agent(
+    `Run this exact shell script in ONE Bash call. It prints one line per candidate of the form "FLV <letter> d=<0|1> p=<0|1>". Then return the structured results: for EACH printed FLV line, an entry {blind: the letter, deliverable: (d==1), provenance: (p==1)}. Report exactly what the script printed — do not infer or change values.\n\n${script}`,
+    { model: 'haiku', schema: STAGE_SCHEMA, phase: phaseTitle, label: 'stage' }
+  ).catch(() => null)
   const v = {}
-  for (const m of String(out).matchAll(/FLV (\w+) d=(\d) p=(\d)/g)) v[m[1]] = { d: m[2] === '1', p: m[3] === '1' }
-  const parsed = Object.keys(v).length > 0
+  for (const r of (res && Array.isArray(res.results) ? res.results : [])) v[String(r.blind).trim()] = r
   return list.map(c => {
-    const r = v[c.blind] || { d: true, p: true }
-    const valid = !parsed || (r.d && r.p)
-    return { ...c, ws: `${reviewDir}/${c.blind}`, valid, failReason: valid ? '' : (!r.d ? 'no deliverable saved' : 'missing provenance marker') }
+    const r = v[c.blind]                           // FAIL CLOSED: missing/unparsed → invalid
+    const valid = !!(r && r.deliverable && r.provenance)
+    const failReason = valid ? '' : (!r ? 'staging result missing (failed closed)' : (!r.deliverable ? 'no deliverable saved' : 'provenance check failed (timeout/error/empty)'))
+    return { ...c, ws: `${reviewDir}/${c.blind}`, valid, failReason }
   })
 }
 
@@ -250,6 +279,20 @@ function reconcile(result, labels) {
 // rotate to decorrelate the blind letter from dispatch order
 const blindLabel = (list, rot) => list.map((_, i) => list[(i + rot) % list.length]).map((c, i) => ({ ...c, blind: LABELS[i] }))
 
+// #3: an Opus judge runs AFTER the maximum spend, so never let one judge error crash the whole paid
+// run — retry once, then return a failure marker the caller turns into a partial, inspectable result.
+async function judge(kind, blindList, guidanceWanted, poolPath, schema, phaseTitle, label) {
+  const prompt = judgePrompt(kind, blindList, guidanceWanted, poolPath)
+  for (let i = 1; i <= 2; i++) {
+    try {
+      return reconcile(await agent(prompt, { model: 'opus', schema, phase: phaseTitle, label }), blindList.map(c => c.blind))
+    } catch (e) {
+      log(`${label} judge attempt ${i}/2 failed: ${String(e).slice(0, 120)}`)
+      if (i === 2) return { __failed: String(e).slice(0, 160) }
+    }
+  }
+}
+
 // ---- Round 1 ----
 phase('Round 1')
 await buildContext() // shared context bundle (no-op unless args.contextFiles given) — built once, before the attempts
@@ -263,42 +306,42 @@ const blind1 = staged1.filter(c => c.valid)
 const r1mapping = staged1.map(c => ({ candidate: c.blind, model: c.displayModel, valid: c.valid, ...(c.valid ? {} : { failReason: c.failReason }) }))
 if (!blind1.length) return { mode, n: attempts.length, error: 'no valid round-1 deliverables', round1: { mapping: r1mapping } }
 
-const review = reconcile(
-  await agent(judgePrompt('reviewer', blind1, mode === 'two'),
-    { model: 'opus', schema: mode === 'two' ? REVIEW_SCHEMA : RANK_SCHEMA, phase: 'Review', label: 'review' }),
-  blind1.map(c => c.blind)
-)
+const review = await judge('reviewer', blind1, mode === 'two', `${runDir}/review-1/_pool.md`,
+  mode === 'two' ? REVIEW_SCHEMA : RANK_SCHEMA, 'Review', 'review')
+if (review.__failed) return { mode, n: attempts.length, round1: { mapping: r1mapping }, error: `review judge failed: ${review.__failed}` }
 
 if (mode === 'single') {
   return { mode, n: attempts.length, round1: { mapping: r1mapping, review } }
 }
 
 // ---- Two pass ----
-const winner1 = blind1.find(c => c.blind === review.winner) || blind1[0]
+const winner1 = blind1.find(c => c.blind === review.winner)
+if (!winner1) log(`round-1 winner "${review.winner}" not among valid candidates; carrying the first valid (${blind1[0].blind})`) // #8
+const champ = winner1 || blind1[0]
 phase('Round 2')
-log(`Round 2: ${attempts.length} guided attempts; carrying over round-1 winner (${winner1.displayModel})`)
+log(`Round 2: ${attempts.length} guided attempts; carrying over round-1 winner (${champ.displayModel})`)
 const r2 = (await parallel(attempts.map(a => () => dispatch(a, `${runDir}/round-2/${a.label}`, review.guidance, 'Round 2')))).filter(Boolean)
 
 // final pool = round-2 attempts + the carried-over round-1 winner. Staging erases the round path,
 // so the judge cannot tell which finalist is the carryover.
-const pool = [
+const finalPool = [
   ...r2.map(c => ({ ws: c.ws, displayModel: c.displayModel, dispatch: c.dispatch, round: 2 })),
-  { ws: winner1.ws, displayModel: winner1.displayModel, dispatch: winner1.dispatch, round: 1 },
+  { ws: champ.ws, displayModel: champ.displayModel, dispatch: champ.dispatch, round: 1 },
 ]
 phase('Final rank')
-const stagedF = await stageAndValidate(blindLabel(pool, 2), `${runDir}/review-final`, 'Final rank')
+const stagedF = await stageAndValidate(blindLabel(finalPool, 2), `${runDir}/review-final`, 'Final rank')
 const blindF = stagedF.filter(c => c.valid)
-const finalRank = reconcile(
-  await agent(judgePrompt('final ranker', blindF, false),
-    { model: 'opus', schema: RANK_SCHEMA, phase: 'Final rank', label: 'final-rank' }),
-  blindF.map(c => c.blind)
-)
 const finalMapping = stagedF.map(c => ({ candidate: c.blind, model: c.displayModel, round: c.round, valid: c.valid, ...(c.valid ? {} : { failReason: c.failReason }) }))
+if (!blindF.length) return { mode, n: attempts.length, round1: { mapping: r1mapping }, guidance: review.guidance, final: { mapping: finalMapping, error: 'no valid finalists' } } // #5
 
+const finalRank = await judge('final ranker', blindF, false, `${runDir}/review-final/_pool.md`, RANK_SCHEMA, 'Final rank', 'final-rank')
+if (finalRank.__failed) return { mode, n: attempts.length, round1: { mapping: r1mapping }, guidance: review.guidance, final: { mapping: finalMapping, error: `final-rank judge failed: ${finalRank.__failed}` } }
+
+// #7: resolve winnerRound against the VALID finalist set; omit the field if unresolved (no literal "undefined")
+const winnerEntry = blindF.find(c => c.blind === finalRank.winner)
 return {
   mode, n: attempts.length,
   round1: { mapping: r1mapping, review },
   guidance: review.guidance,
-  final: { mapping: finalMapping, rank: finalRank,
-           winnerRound: (finalMapping.find(m => m.candidate === finalRank.winner) || {}).round },
+  final: { mapping: finalMapping, rank: finalRank, ...(winnerEntry ? { winnerRound: winnerEntry.round } : {}) },
 }
