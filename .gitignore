@@ -49,5 +49,9 @@ tmp/
 temp/
 *.tmp
 
+# Farnsworth Loop / Best of N run scratch
+.runs/
+**/.runs/
+
 # Local settings that shouldn't be shared
 .claude/settings.local.json

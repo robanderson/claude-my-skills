@@ -1,6 +1,6 @@
 ---
 name: farnsworth-loop
-description: "Run a Farnsworth Loop tournament in one of two modes. First ask the user which model quality to use for the attempts (Opus, Sonnet, Haiku, or Mixed). SINGLE PASS: produce N independent solutions in parallel, then a blind Opus reviewer scores them, lists pros and cons, ranks them, and names a winner. TWO PASS: the same first round, but the Opus reviewer also distils what worked and what failed into guidance; the losing attempts are discarded, a second round of N fresh attempts is run with that guidance (positives to emulate, pitfalls to avoid), the saved round one winner is added back, and a final Opus ranker picks the overall winner. Trigger on the explicit marker 'farnsworth loop:N' (single pass, N attempts) or 'farnsworth loop:N:2' (two pass, N attempts per round), case-insensitive, with or without a leading colon and surrounding spaces, e.g. 'do abc :farnsworth loop:5' or 'do abc: farnsworth loop:5:2'. The optional third segment is the number of passes: omitted or 1 means single pass, 2 means two pass."
+description: "Run a Farnsworth Loop tournament in one of two modes. First ask the user which model quality to use for the attempts (Anthropic Opus, Sonnet, Haiku; a GLM z.ai model via the glm CLI; or Mixed per-attempt). SINGLE PASS: produce N independent solutions in parallel, then a blind Opus reviewer scores them, lists pros and cons, ranks them, and names a winner. TWO PASS: the same first round, but the Opus reviewer also distils what worked and what failed into guidance; the losing attempts are discarded, a second round of N fresh attempts is run with that guidance (positives to emulate, pitfalls to avoid), the saved round one winner is added back, and a final Opus ranker picks the overall winner. Trigger on the explicit marker 'farnsworth loop:N' (single pass, N attempts) or 'farnsworth loop:N:2' (two pass, N attempts per round), case-insensitive, with or without a leading colon and surrounding spaces, e.g. 'do abc :farnsworth loop:5' or 'do abc: farnsworth loop:5:2'. The optional third segment is the number of passes: omitted or 1 means single pass, 2 means two pass."
 ---
 
 # Farnsworth Loop
@@ -47,20 +47,30 @@ Validate N before continuing:
 
 ## Phase 1: Choose the models (mandatory gate, stop here — both modes)
 
-This is the gate from the operating rule. Ask it as your first response to the trigger and **wait for the answer before doing anything else**. Ask exactly this, as a four option selection, then stop:
+This is the gate from the operating rule. Ask it as your first response to the trigger and **wait for the answer before doing anything else**. Ask exactly this, as a five option selection, then stop:
 
 > Which quality of sub-agent do you want for the attempts?
-> 1. Opus (highest capability)
-> 2. Sonnet (balanced)
-> 3. Haiku (fastest, cheapest)
-> 4. Mixed (choose a model per attempt)
+> 1. Opus — Anthropic, highest capability
+> 2. Sonnet — Anthropic, balanced
+> 3. Haiku — Anthropic, fastest and cheapest
+> 4. GLM — z.ai models (I'll then ask which GLM model)
+> 5. Mixed — choose a model per attempt (Anthropic or GLM)
 
 Handle the answer:
 
-- **Options 1, 2, or 3 (uniform):** every attempt uses that single model. Record the assignment, e.g. for N = 4 with Sonnet: `[sonnet, sonnet, sonnet, sonnet]`.
-- **Option 4 (Mixed):** walk through the attempts one at a time, attempt 1 to attempt N, asking the same question but offering only the three concrete models (Opus, Sonnet, Haiku), not Mixed again. Record each choice, e.g. `[opus, sonnet, sonnet, haiku]`.
+- **Options 1, 2, or 3 (uniform Anthropic):** every attempt uses that single Anthropic model. Record the assignment, e.g. for N = 4 with Sonnet: `[sonnet, sonnet, sonnet, sonnet]`.
+- **Option 4 (GLM):** drill down with a second question, then stop again and wait. Every attempt uses the one chosen GLM model:
+  > Which GLM model?
+  > 1. glm-5.2 — strongest, 1M context
+  > 2. glm-5.1
+  > 3. glm-5
+  > 4. glm-4.7
+  > 5. glm-4.5-air — fastest, cheapest
 
-In two pass, the model assignment applies to **both rounds**: round two re-uses the same per-attempt list. If the user explicitly wants different models for round two, ask the four-option question again for round two; otherwise re-use round one's assignment. Model aliases and full identifiers are in `references/orchestration.md`. The reviewer and the final ranker are **always Opus**, regardless of what the attempts use.
+  Record the uniform assignment, e.g. for N = 4 with glm-5.2: `[glm-5.2, glm-5.2, glm-5.2, glm-5.2]`.
+- **Option 5 (Mixed):** walk through the attempts one at a time, attempt 1 to attempt N. For each, ask which concrete model to use, offering the three Anthropic models **and** the five GLM models (Opus, Sonnet, Haiku, glm-5.2, glm-5.1, glm-5, glm-4.7, glm-4.5-air) — not "GLM" as a group and not "Mixed" again. Record each choice, e.g. `[opus, glm-5.2, sonnet, glm-4.5-air]`.
+
+In two pass, the model assignment applies to **both rounds**: round two re-uses the same per-attempt list. If the user explicitly wants different models for round two, re-ask the gate for round two; otherwise re-use round one's assignment. Model aliases, the GLM `--model` flag mapping, and dispatch mechanics are in `references/orchestration.md`. **Anthropic attempts dispatch via the Task tool; GLM attempts dispatch by shelling out to the `glm` CLI (agentic, with tools), per the orchestration reference.** The reviewer and the final ranker are **always Anthropic Opus**, regardless of what the attempts use — the judge is held fixed so the comparison is consistent.
 
 ## Phase 1b: Diversity injection (default on — both modes)
 
@@ -142,7 +152,7 @@ Include brief run metadata: the mode, N, the model per attempt, the diversity mo
 
 - Marker: `farnsworth loop:N` (single) / `farnsworth loop:N:2` (two pass), case-insensitive, optional leading colon and spaces. Third segment is the pass count (1 or 2).
 - N is per round, an integer of 2 or more. Confirm volume at N ≥ 8 (single pass) or N ≥ 6 (two pass).
-- Phase 1 model question: four options; Mixed loops per attempt; in two pass the assignment applies to both rounds.
+- Phase 1 model question: five options (Opus, Sonnet, Haiku, GLM→submenu, Mixed); GLM drills down to one of glm-5.2/glm-5.1/glm-5/glm-4.7/glm-4.5-air; Mixed loops per attempt over all eight concrete models; in two pass the assignment applies to both rounds. Anthropic attempts dispatch via the Task tool, GLM attempts via the `glm` CLI (agentic). Reviewer/ranker are always Anthropic Opus.
 - Diversity injection (default on): each attempt draws a distinct framing so siblings do not converge. Pool A approach nudges by default (blind-safe); Pool B objective lenses opt-in. Without replacement, seeded, logged. See `references/diversity-injection.md`.
 - Round attempts: N parallel, isolated, identical brief plus one diversity modifier, no cross-talk.
 - Review/rank (Opus, blind): pros and cons per candidate, rank, name winner. In two pass also distil positives-to-consider and challenges-to-avoid, save the winner, discard the other artifacts.
