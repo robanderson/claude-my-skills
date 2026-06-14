@@ -1,0 +1,24 @@
+{
+  "skill_name": "farnsworth-loop",
+  "note": "Should-trigger / should-not-trigger queries for tuning activation. The marker is 'farnsworth loop:N' (single pass) or 'farnsworth loop:N:2' (two pass), case-insensitive, with an optional leading colon and surrounding spaces. The third segment is the pass count: omitted or 1 = single, 2 = two pass. 'mode' is the expected mode for should_trigger cases. Non-triggers are genuine non-tournaments or other tournament phrasings that belong to the separate best-of-n skill, not this explicitly-named one.",
+  "queries": [
+    {"query": "do abc :farnsworth loop:5", "should_trigger": true, "mode": "single"},
+    {"query": "do abc: farnsworth loop:5:2", "should_trigger": true, "mode": "two"},
+    {"query": "write a python program for hangman game, farnsworth loop:4", "should_trigger": true, "mode": "single"},
+    {"query": "build a CSV parser farnsworth loop:3", "should_trigger": true, "mode": "single"},
+    {"query": "refactor this function FARNSWORTH LOOP:5", "should_trigger": true, "mode": "single"},
+    {"query": "refactor this function, farnsworth loop:5:1", "should_trigger": true, "mode": "single"},
+    {"query": "implement a token bucket rate limiter :farnsworth loop:6:2", "should_trigger": true, "mode": "two"},
+    {"query": "draft a distributor pitch email, Farnsworth Loop:4:2", "should_trigger": true, "mode": "two"},
+    {"query": "two-round attempt on this regex farnsworth loop:5:2", "should_trigger": true, "mode": "two"},
+    {"query": "what is iterative refinement in LLM sampling?", "should_trigger": false},
+    {"query": "explain how genetic algorithms do selection and mutation", "should_trigger": false},
+    {"query": "review this code and give me two passes of feedback", "should_trigger": false},
+    {"query": "i made two attempts at this already, which is better?", "should_trigger": false},
+    {"query": "summarise this document in two passes, skim then detail", "should_trigger": false},
+    {"query": "set up a two-stage build pipeline in CI", "should_trigger": false},
+    {"query": "compare Opus and Sonnet on a coding task", "should_trigger": false},
+    {"query": "give me one strong solution, no tournament", "should_trigger": false},
+    {"query": "what is the Farnsworth lens in photography?", "should_trigger": false}
+  ]
+}
