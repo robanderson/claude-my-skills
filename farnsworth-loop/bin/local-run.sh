@@ -9,19 +9,18 @@ LOG=_local_run.log
 TIMEOUT="${FL_TIMEOUT_SECS:-300}"   # wall-clock backstop (seconds)
 MAXTURNS="${FL_MAX_TURNS:-20}"       # tight cap: local models tend to ignore "single pass" and loop
 
-# Resolve the local server token: prefer the env var; fall back to the user's ~/.zshrc
-# export (the token is the user's own, for their own on-device server — it stays local).
-TOKEN="${OMLX_AUTH_TOKEN:-}"
-if [ -z "$TOKEN" ] && [ -f "$HOME/.zshrc" ]; then
-  TOKEN=$(grep -E '^[[:space:]]*export[[:space:]]+OMLX_AUTH_TOKEN=' "$HOME/.zshrc" | tail -1 | sed -E 's/^[^=]*=//; s/^["'"'"']//; s/["'"'"']$//')
-fi
-if [ -z "$TOKEN" ]; then echo "FARNSWORTH-LOCAL-ERROR OMLX_AUTH_TOKEN missing (set it or export in ~/.zshrc)" | tee -a "$LOG"; exit 3; fi
+# OMLX_AUTH_TOKEN comes from the environment — the same uniform key handling every runner uses
+# (glm-run.sh reads ZAI_API_KEY, minimax-run.sh reads MINIMAX_API_KEY). It is exported in the user's
+# ~/.zshrc and inherited into the session at launch. Do NOT source/grep rc files here.
+if [ -z "${OMLX_AUTH_TOKEN:-}" ]; then echo "FARNSWORTH-LOCAL-ERROR OMLX_AUTH_TOKEN missing (export in ~/.zshrc and relaunch)" | tee -a "$LOG"; exit 3; fi
 [ -f _brief.txt ] || { echo "FARNSWORTH-LOCAL-ERROR _brief.txt missing" | tee -a "$LOG"; exit 4; }
 
 echo "FARNSWORTH-LOCAL-PROVENANCE endpoint=127.0.0.1:8000 flag=${FLAG} max-turns=${MAXTURNS} timeout=${TIMEOUT}s" >> "$LOG"
 # Portable hard timeout (no coreutils `timeout` on macOS): fork the call, SIGALRM -> TERM/KILL.
+# </dev/null pins stdin: open (non-TTY) stdin makes `claude -p` warn "no stdin data received in 3s"
+# and can stall the whole wall-clock producing nothing. Uniform with glm/codex/minimax runners.
 ANTHROPIC_BASE_URL="http://127.0.0.1:8000" \
-ANTHROPIC_AUTH_TOKEN="$TOKEN" \
+ANTHROPIC_AUTH_TOKEN="$OMLX_AUTH_TOKEN" \
 ANTHROPIC_DEFAULT_OPUS_MODEL="Qwen3.5-122B-A10B-LM-MLX-6.5bit" \
 ANTHROPIC_DEFAULT_SONNET_MODEL="mlx-community--Qwen3.6-35B-A3B-8bit" \
 ANTHROPIC_DEFAULT_HAIKU_MODEL="gemma-4-26b-a4b-it-8bit" \
@@ -32,7 +31,7 @@ perl -e '
   if ($p == 0) { exec @ARGV; exit 127 }
   $SIG{ALRM} = sub { kill "TERM", $p; sleep 3; kill "KILL", $p; exit 124 };
   alarm $t; waitpid($p, 0); exit($? >> 8);
-' "$TIMEOUT" claude -p "$(cat _brief.txt)" $FLAG --max-turns "$MAXTURNS" --permission-mode acceptEdits --allowedTools "Bash Read Write Edit" >> "$LOG" 2>&1
+' "$TIMEOUT" claude -p "$(cat _brief.txt)" $FLAG --max-turns "$MAXTURNS" --permission-mode acceptEdits --allowedTools "Bash Read Write Edit" </dev/null >> "$LOG" 2>&1
 RC=$?
 [ "$RC" -eq 124 ] && echo "FARNSWORTH-LOCAL-TIMEOUT secs=${TIMEOUT}" >> "$LOG"
 echo "FARNSWORTH-LOCAL-DONE exit=$RC" >> "$LOG"
