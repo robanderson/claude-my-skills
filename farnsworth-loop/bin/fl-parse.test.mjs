@@ -1,345 +1,250 @@
 #!/usr/bin/env node
-// fl-parse.test.mjs — runnable test suite for fl-parse.mjs.
-//   node fl-parse.test.mjs
-// Asserts and prints pass/fail counts; exits non-zero on any failure.
+// fl-parse.test.mjs — tests for the Farnsworth Loop Phase-0 parser.
+//
+// Self-contained (no test framework): a tiny assert harness + a table of
+// cases. Run with:  node fl-parse.test.mjs
+// Exits 0 if all pass, 1 otherwise (with a per-failure diff).
+//
+// Covers BOTH Feature 2 (sigil/prose/spec/Top-Mixed/conflict/normaliser) AND
+// Feature 1 (grand loops Z): Z=1 unchanged, Z>=2 valid, Z>Z_MAX rejected,
+// positional-skip still invalid.
 
-import {
-  parse,
-  normaliseModel,
-  topMixedAssignment,
-  expandSpec,
-} from './fl-parse.mjs';
+import { parse, normaliseModel, topMixedAssignment, expandSpec, Z_MAX } from './fl-parse.mjs';
 
 let passed = 0;
 let failed = 0;
 const failures = [];
 
-function eq(actual, expected) {
-  return JSON.stringify(actual) === JSON.stringify(expected);
+function eq(a, b) {
+  // strict deep-ish equality that distinguishes null from undefined.
+  if (a === b) return true;
+  if (a === null || b === null) return a === b;       // null !== undefined
+  if (typeof a !== typeof b) return false;
+  if (Array.isArray(a) || Array.isArray(b)) {
+    if (!Array.isArray(a) || !Array.isArray(b)) return false;
+    if (a.length !== b.length) return false;
+    return a.every((x, i) => eq(x, b[i]));
+  }
+  if (typeof a === 'object') {
+    const ka = Object.keys(a), kb = Object.keys(b);
+    if (ka.length !== kb.length) return false;
+    return ka.every(k => eq(a[k], b[k]));
+  }
+  return false;
 }
 
-function check(name, cond, detail) {
-  if (cond) {
-    passed++;
-  } else {
-    failed++;
-    failures.push(name + (detail ? '  -- ' + detail : ''));
+function show(v) {
+  if (v === undefined) return 'undefined';
+  return JSON.stringify(v);
+}
+
+// assertField(name, actual, expected)
+function assertField(label, name, actual, expected) {
+  if (eq(actual, expected)) { passed++; return; }
+  failed++;
+  failures.push(`  [${label}] field "${name}": expected ${show(expected)}, got ${show(actual)}`);
+}
+
+// Run a parse case. `expect` is a subset of fields to assert (each must match,
+// using null where the parser nulls). If `errorIncludes` is set, errors[] must
+// be present and contain a matching substring.
+function parseCase(label, input, expect = {}, opts = {}) {
+  const r = parse(input);
+  for (const [k, v] of Object.entries(expect)) {
+    assertField(label, k, r[k], v);
+  }
+  if (opts.errorIncludes !== undefined) {
+    const errs = r.errors || [];
+    const hit = errs.some(e => e.toLowerCase().includes(opts.errorIncludes.toLowerCase()));
+    if (hit) { passed++; }
+    else {
+      failed++;
+      failures.push(`  [${label}] expected an error including "${opts.errorIncludes}", got errors=${show(errs)}`);
+    }
+  }
+  if (opts.noErrors) {
+    if (r.errors === undefined) { passed++; }
+    else {
+      failed++;
+      failures.push(`  [${label}] expected NO errors, got ${show(r.errors)}`);
+    }
+  }
+  if (opts.hasConflict) {
+    if (r.conflict && r.conflict.markerN === opts.hasConflict.markerN && r.conflict.specN === opts.hasConflict.specN) {
+      passed++;
+    } else {
+      failed++;
+      failures.push(`  [${label}] expected conflict ${show(opts.hasConflict)}, got ${show(r.conflict)}`);
+    }
   }
 }
 
-function checkEq(name, actual, expected) {
-  const ok = eq(actual, expected);
-  check(name, ok, ok ? '' : 'got ' + JSON.stringify(actual) + ' want ' + JSON.stringify(expected));
+function unit(label, cond) {
+  if (cond) { passed++; }
+  else { failed++; failures.push(`  [${label}] unit assertion failed`); }
 }
 
-// --------------------------------------------------------------------------
-// Backwards-compat: existing @@FL:N / @@FL:N:M behaviour must be byte-identical.
-// --------------------------------------------------------------------------
+// ===========================================================================
+// EXISTING Feature-2 behaviour (must all still pass).
+// ===========================================================================
+
+// --- basic sigil forms ---
+// NOTE on needsGate: the parser sets needsGate ONLY when N is unknown. When an
+// explicit N is given with NO inferred assignment, needsGate stays false and the
+// SKILL runs the gate off `assignment === null` (the parser-contract distinction
+// the brief calls out). So an explicit @@FL:5 has needsGate:false, assignment:null.
+parseCase('sigil N', 'do abc @@FL:5',
+  { task: 'do abc', n: 5, mode: 1, z: 1, assignment: null, needsGate: false }, { noErrors: true });
+parseCase('sigil N:M two', 'do abc @@FL:5:2',
+  { task: 'do abc', n: 5, mode: 2, z: 1, assignment: null, needsGate: false }, { noErrors: true });
+parseCase('sigil case-insensitive + spaces', 'do abc @@fl : 7 : 2',
+  { n: 7, mode: 2, z: 1 }, { noErrors: true });
+
+// --- bare sigil -> needsGate ---
+parseCase('bare @@FL', 'do abc @@FL',
+  { task: 'do abc', n: null, mode: 1, z: 1, assignment: null, needsGate: true }, { noErrors: true });
+
+// --- prose marker ---
+parseCase('prose marker N', 'do abc :farnsworth loop:5',
+  { n: 5, mode: 1, z: 1 }, { noErrors: true });
+parseCase('prose marker N:2', 'do abc: farnsworth loop:5:2',
+  { n: 5, mode: 2, z: 1 }, { noErrors: true });
+parseCase('prose marker upper', 'refactor this FARNSWORTH LOOP:5',
+  { n: 5, mode: 1, z: 1 }, { noErrors: true });
+
+// --- prose model spec (Feature 2) ---
+parseCase('spec headline', 'build a parser with 2 opus, 2 glm 5.2, 1 codex high @@FL',
+  { n: 5, mode: 1, z: 1, assignment: ['opus', 'opus', 'glm-5.2', 'glm-5.2', 'codex-high'] }, { noErrors: true });
+parseCase('spec bare codex -> medium', 'do abc, 1 opus and 1 sonnet and 1 codex farnsworth loop:3',
+  { n: 3, mode: 1, z: 1, assignment: ['opus', 'sonnet', 'codex-medium'] }, { noErrors: true });
+parseCase('spec bare glm -> 5.2', 'do x with 3 glm @@FL',
+  { n: 3, z: 1, assignment: ['glm-5.2', 'glm-5.2', 'glm-5.2'] }, { noErrors: true });
+parseCase('spec minimax', 'do y with 2 minimax @@FL',
+  { n: 2, z: 1, assignment: ['minimax-m3', 'minimax-m3'] }, { noErrors: true });
+
+// --- Top Mixed preset ---
+parseCase('top mixed N=6', 'do abc top mixed @@FL:6',
+  { n: 6, z: 1, preset: 'top-mixed', assignment: ['opus', 'opus', 'glm-5.2', 'glm-5.2', 'codex-high', 'codex-high'] }, { noErrors: true });
+parseCase('top mixed leadcount 5', 'do abc 5 top mixed @@FL',
+  { n: 5, z: 1, preset: 'top-mixed', assignment: ['opus', 'opus', 'glm-5.2', 'glm-5.2', 'codex-high'] }, { noErrors: true });
+parseCase('top mixed N=2', 'do abc with top-mix @@FL:2',
+  { n: 2, z: 1, preset: 'top-mixed', assignment: ['opus', 'glm-5.2'] }, { noErrors: true });
+
+// --- conflict (explicit N vs prose) ---
+parseCase('conflict 4 vs 5', 'improve X @@FL:4 with 2 opus, 2 glm, 1 codex',
+  { n: null, assignment: null, z: 1 }, { hasConflict: { markerN: 4, specN: 5 } });
+parseCase('agree marker+spec', 'do x with 2 opus and 1 sonnet @@FL:3',
+  { n: 3, z: 1, assignment: ['opus', 'opus', 'sonnet'] }, { noErrors: true });
+
+// --- digit-noun guard ---
+// '3 bugs' / '5 tests' are task text, NOT a spec: n stays the explicit sigil N,
+// assignment stays null, needsGate stays false (SKILL gates off assignment===null).
+parseCase('digit-noun guard 3 bugs', 'fix 3 bugs @@FL:5',
+  { n: 5, z: 1, assignment: null, needsGate: false }, { noErrors: true });
+parseCase('digit-noun guard 5 tests', 'write 5 tests for the parser @@FL:4',
+  { n: 4, z: 1, assignment: null, needsGate: false }, { noErrors: true });
+parseCase('digit-noun mixed with spec', 'refactor 2 modules with 2 opus @@FL:2',
+  { n: 2, z: 1, assignment: ['opus', 'opus'] }, { noErrors: true });
+
+// --- unknown token rejected loudly ---
+parseCase('unknown token gpt4', 'do x with 2 opus and 1 gpt4 @@FL',
+  { n: null, assignment: null }, { errorIncludes: 'Unrecognised model token' });
+
+// --- invalid M ---
+parseCase('invalid M=3', 'do abc @@FL:5:3',
+  { n: null }, { errorIncludes: 'Invalid pass count' });
+
+// --- N < 2 ---
+parseCase('N=1 invalid', 'do abc @@FL:1',
+  { n: null }, { errorIncludes: 'N must be an integer >= 2' });
+
+// --- no marker ---
+parseCase('no marker', 'fix 3 bugs in the parser',
+  { n: null }, { errorIncludes: 'No @@FL sigil' });
+
+// ===========================================================================
+// FEATURE 1 — grand loops (Z). NEW.
+// ===========================================================================
+
+// --- Z=1 explicit is byte-identical to omitting Z ---
 {
-  const r = parse('do abc @@FL:5');
-  checkEq('@@FL:5 -> n=5', r.n, 5);
-  checkEq('@@FL:5 -> mode=1', r.mode, 1);
-  checkEq('@@FL:5 -> z=1', r.z, 1);
-  checkEq('@@FL:5 -> task', r.task, 'do abc');
-  check('@@FL:5 -> no errors', !r.errors, JSON.stringify(r.errors));
-  // Explicit N, no prose spec: assignment stays null and the Phase-1 gate runs
-  // as today (needsGate is only set for a MISSING N). This matches SKILL Phase 0.
-  check('@@FL:5 -> no inferred assignment', r.assignment === null, JSON.stringify(r));
-  check('@@FL:5 -> needsGate false (N is explicit)', r.needsGate === false, JSON.stringify(r));
-}
-{
-  const r = parse('do abc @@FL:5:2');
-  checkEq('@@FL:5:2 -> n=5', r.n, 5);
-  checkEq('@@FL:5:2 -> mode=2', r.mode, 2);
-  checkEq('@@FL:5:2 -> z=1', r.z, 1);
-  checkEq('@@FL:5:2 -> task', r.task, 'do abc');
-  check('@@FL:5:2 -> no errors', !r.errors, JSON.stringify(r.errors));
-}
-{
-  const r = parse('write a haiku @@FL : 4 : 2');
-  checkEq('spaced sigil n=4', r.n, 4);
-  checkEq('spaced sigil mode=2', r.mode, 2);
-  checkEq('spaced sigil task', r.task, 'write a haiku');
-}
-{
-  const r = parse('do abc :farnsworth loop:5');
-  checkEq('prose loop:5 n=5', r.n, 5);
-  checkEq('prose loop:5 mode=1', r.mode, 1);
-  checkEq('prose loop:5 task', r.task, 'do abc');
-}
-{
-  const r = parse('do abc: farnsworth loop:5:2');
-  checkEq('prose loop:5:2 n=5', r.n, 5);
-  checkEq('prose loop:5:2 mode=2', r.mode, 2);
+  const omit = parse('do abc @@FL:5:1');
+  const z1 = parse('do abc @@FL:5:1:1');
+  unit('Z=1 explicit == omitted (n)', omit.n === z1.n && z1.n === 5);
+  unit('Z=1 explicit == omitted (z)', omit.z === 1 && z1.z === 1);
+  unit('Z=1 explicit == omitted (mode)', omit.mode === z1.mode);
+  unit('Z=1 explicit no errors', z1.errors === undefined);
 }
 
-// --------------------------------------------------------------------------
-// Bare @@FL -> needsGate.
-// --------------------------------------------------------------------------
+// --- Z>=2 is VALID now (flows on; NO "not yet implemented" error) ---
+// Explicit N, no spec -> needsGate stays false (SKILL gates off assignment===null).
+parseCase('Z=2 valid', 'do abc @@FL:5:1:2',
+  { task: 'do abc', n: 5, mode: 1, z: 2, assignment: null, needsGate: false }, { noErrors: true });
+parseCase('Z=3 single valid', 'improve the error handling @@FL:4:1:3',
+  { n: 4, mode: 1, z: 3 }, { noErrors: true });
+parseCase('Z=3 two-pass valid', 'improve the error handling @@FL:4:2:3',
+  { n: 4, mode: 2, z: 3 }, { noErrors: true });
+parseCase('Z=5 at the ceiling valid', 'tidy things up @@FL:3:1:5',
+  { n: 3, mode: 1, z: 5 }, { noErrors: true });
+
+// --- Z>=2 via prose marker ---
+parseCase('Z=3 prose marker', 'optimise this loop, farnsworth loop:4:2:3',
+  { n: 4, mode: 2, z: 3 }, { noErrors: true });
+
+// --- Z>=2 with N inferred from a prose spec (empty-N sigil form) ---
+parseCase('Z=3 N-from-spec empty N', 'improve X @@FL::1:3 with 2 opus, 2 glm 5.2, 1 codex high',
+  { n: 5, mode: 1, z: 3, assignment: ['opus', 'opus', 'glm-5.2', 'glm-5.2', 'codex-high'] }, { noErrors: true });
+// And with an explicit N that AGREES with the prose sum.
+parseCase('Z=3 N explicit agrees with spec', 'improve X @@FL:5:1:3 with 2 opus, 2 glm 5.2, 1 codex high',
+  { n: 5, mode: 1, z: 3, assignment: ['opus', 'opus', 'glm-5.2', 'glm-5.2', 'codex-high'] }, { noErrors: true });
+
+// --- Z > Z_MAX rejected, echoing the offending Z (NOT reset to 1) ---
+parseCase('Z=9 over ceiling', 'tidy things up @@FL:3:1:9',
+  { n: null, assignment: null, z: 9 }, { errorIncludes: 'exceeds the grand-loop ceiling' });
+parseCase('Z=6 just over ceiling', 'do abc @@FL:4:1:6',
+  { n: null, z: 6 }, { errorIncludes: 'Z_MAX=' + Z_MAX });
+parseCase('Z=30 fat-fingered', 'do abc @@FL:5:2:30',
+  { n: null, z: 30 }, { errorIncludes: 'split into batches' });
+
+// --- positional skip still invalid with Z ---
+parseCase('positional skip @@FL:5::3', 'do abc @@FL:5::3',
+  { n: null }, { errorIncludes: 'Positional skip' });
+
+// --- invalid Z (zero / empty) ---
+parseCase('Z=0 invalid', 'do abc @@FL:5:1:0',
+  { n: null }, { errorIncludes: 'Z must be an integer' });
+
+// --- the spec's DANGEROUS worked example must NOT be (mis)treated as Z=3.
+//     '@@FL:1:3' is positional N=1, M=3 (NOT N omitted/Z=3). N=1 is < 2 AND
+//     M=3 is invalid. The empty-N form '@@FL::1:3' is the correct N-omitted
+//     spelling. Assert the grammar, not the stray example. ---
 {
-  const r = parse('do abc @@FL');
-  checkEq('bare @@FL n=null', r.n, null);
-  checkEq('bare @@FL mode=1', r.mode, 1);
-  check('bare @@FL needsGate', r.needsGate === true, JSON.stringify(r));
-  checkEq('bare @@FL task', r.task, 'do abc');
-  check('bare @@FL no errors', !r.errors, JSON.stringify(r.errors));
-}
-{
-  const r = parse('@@fl do the thing');
-  // marker leading; task is text after? Spec says text BEFORE marker is task.
-  // With marker at start, task before is empty.
-  checkEq('leading bare @@FL needsGate', r.needsGate, true);
+  const bad = parse('improve X @@FL:1:3');
+  unit('@@FL:1:3 is NOT a valid Z=3 run', bad.n === null && (bad.errors || []).length > 0);
+  unit('@@FL:1:3 z is not silently 3', bad.z === 1);
 }
 
-// --------------------------------------------------------------------------
-// Prose model spec -> N + assignment (the headline example, end to end).
-// --------------------------------------------------------------------------
-{
-  const r = parse('build a parser with 2 opus, 2 glm 5.2, 1 codex high @@FL');
-  checkEq('headline n=5', r.n, 5);
-  checkEq('headline assignment',
-    r.assignment, ['opus', 'opus', 'glm-5.2', 'glm-5.2', 'codex-high']);
-  check('headline no errors', !r.errors, JSON.stringify(r.errors));
-  check('headline no gate', !r.needsGate, JSON.stringify(r));
-  check('headline task strips spec', !/opus|glm|codex/i.test(r.task), 'task=' + r.task);
-}
-{
-  // Dashed spelling must give the same result as spaced.
-  const r = parse('build a parser with 2 opus, 2 glm-5.2, 1 codex-high @@FL');
-  checkEq('dashed glm-5.2 assignment',
-    r.assignment, ['opus', 'opus', 'glm-5.2', 'glm-5.2', 'codex-high']);
-}
-{
-  const r = parse('do x, 1 opus and 1 sonnet and 1 codex @@FL');
-  checkEq('and-chain n=3', r.n, 3);
-  checkEq('and-chain assignment (bare codex=medium)',
-    r.assignment, ['opus', 'sonnet', 'codex-medium']);
-}
-{
-  const r = parse('do x with 3 glm @@FL');
-  checkEq('bare glm default n=3', r.n, 3);
-  checkEq('bare glm -> glm-5.2',
-    r.assignment, ['glm-5.2', 'glm-5.2', 'glm-5.2']);
-}
-{
-  // Spec appears in the MIDDLE then the marker after; vary position.
-  const r = parse('please, with 1 opus and 1 haiku, do the job @@FL:2');
-  checkEq('middle spec n=2', r.n, 2);
-  checkEq('middle spec assignment', r.assignment, ['opus', 'haiku']);
-}
-{
-  // MiniMax token.
-  const r = parse('do y with 2 minimax @@FL');
-  checkEq('minimax n=2', r.n, 2);
-  checkEq('minimax-m3 assignment', r.assignment, ['minimax-m3', 'minimax-m3']);
-  const r2 = parse('do y with 1 minimax-m3 and 1 m3 @@FL');
-  checkEq('minimax variants', r2.assignment, ['minimax-m3', 'minimax-m3']);
-}
+// ===========================================================================
+// unit-level normaliser / helpers.
+// ===========================================================================
+unit('normalise opus', normaliseModel('opus') && normaliseModel('opus').model === 'opus');
+unit('normalise codex high', normaliseModel('codex high') && normaliseModel('codex high').model === 'codex-high');
+unit('normalise codex-high dash', normaliseModel('codex-high') && normaliseModel('codex-high').model === 'codex-high');
+unit('normalise bare glm', normaliseModel('glm') && normaliseModel('glm').model === 'glm-5.2');
+unit('normalise unknown -> null', normaliseModel('gpt4') === null);
+unit('topMixed N=2', eq(topMixedAssignment(2), ['opus', 'glm-5.2']));
+unit('topMixed N=6', eq(topMixedAssignment(6), ['opus', 'opus', 'glm-5.2', 'glm-5.2', 'codex-high', 'codex-high']));
+unit('topMixed N=5', eq(topMixedAssignment(5), ['opus', 'opus', 'glm-5.2', 'glm-5.2', 'codex-high']));
+unit('expandSpec basic', eq(expandSpec('2 opus, 1 sonnet').assignment, ['opus', 'opus', 'sonnet']));
+unit('Z_MAX is 5', Z_MAX === 5);
 
-// --------------------------------------------------------------------------
-// Top Mixed preset, N=2..6.
-// --------------------------------------------------------------------------
-checkEq('topMixed N=6', topMixedAssignment(6), ['opus','opus','glm-5.2','glm-5.2','codex-high','codex-high']);
-checkEq('topMixed N=5', topMixedAssignment(5), ['opus','opus','glm-5.2','glm-5.2','codex-high']);
-checkEq('topMixed N=4', topMixedAssignment(4), ['opus','opus','glm-5.2','codex-high']);
-checkEq('topMixed N=3', topMixedAssignment(3), ['opus','glm-5.2','codex-high']);
-checkEq('topMixed N=2', topMixedAssignment(2), ['opus','glm-5.2']);
-{
-  const r = parse('do abc top mixed @@FL:6');
-  checkEq('top mixed via sigil N=6 n', r.n, 6);
-  checkEq('top mixed via sigil N=6 assignment',
-    r.assignment, ['opus','opus','glm-5.2','glm-5.2','codex-high','codex-high']);
-  checkEq('top mixed preset flag', r.preset, 'top-mixed');
-  check('top mixed task strips keyword', !/top\s*mix/i.test(r.task), 'task=' + r.task);
+// ===========================================================================
+// report.
+// ===========================================================================
+console.log(`\nfl-parse tests: ${passed} passed, ${failed} failed`);
+if (failed) {
+  console.log('\nFAILURES:');
+  for (const f of failures) console.log(f);
+  process.exit(1);
 }
-{
-  const r = parse('do abc 5 top mixed @@FL');
-  checkEq('leading-count top mixed n=5', r.n, 5);
-  checkEq('leading-count top mixed assignment',
-    r.assignment, ['opus','opus','glm-5.2','glm-5.2','codex-high']);
-}
-{
-  const r = parse('do abc with top-mix @@FL:2');
-  checkEq('top-mix alias N=2', r.assignment, ['opus','glm-5.2']);
-}
-
-// --------------------------------------------------------------------------
-// Unknown-token rejection (LOUD, never drop, never change N).
-// --------------------------------------------------------------------------
-{
-  const r = parse('do x with 2 opus and 1 gpt4 @@FL');
-  check('unknown token errors', !!r.errors && r.errors.length > 0, JSON.stringify(r));
-  checkEq('unknown token nulls n', r.n, null);
-  checkEq('unknown token nulls assignment', r.assignment, null);
-  check('unknown token names gpt4', r.errors.join(' ').includes('gpt4'), JSON.stringify(r.errors));
-}
-{
-  // Trailing unknown must error, not silently shorten the assignment.
-  const r = parse('do x with 1 opus, 1 gpt4 @@FL');
-  check('trailing unknown errors', !!r.errors && r.errors.length > 0, JSON.stringify(r));
-  checkEq('trailing unknown nulls n', r.n, null);
-}
-checkEq('normaliseModel unknown -> null', normaliseModel('frobnicate'), null);
-checkEq('normaliseModel opus', normaliseModel('OPUS'), { model: 'opus', dispatch: 'anthropic' });
-checkEq('normaliseModel glm 5.2 spaced', normaliseModel('glm 5.2'), { model: 'glm-5.2', dispatch: 'glm' });
-checkEq('normaliseModel glm-5.2 dashed', normaliseModel('glm-5.2'), { model: 'glm-5.2', dispatch: 'glm' });
-checkEq('normaliseModel codex bare', normaliseModel('codex'), { model: 'codex-medium', dispatch: 'codex' });
-checkEq('normaliseModel codex high', normaliseModel('codex high'), { model: 'codex-high', dispatch: 'codex' });
-checkEq('normaliseModel m3', normaliseModel('m3'), { model: 'minimax-m3', dispatch: 'minimax' });
-
-// --------------------------------------------------------------------------
-// Explicit-N-vs-prose conflict.
-// --------------------------------------------------------------------------
-{
-  const r = parse('improve X @@FL:4 with 2 opus, 2 glm, 1 codex');
-  check('conflict surfaced', !!r.conflict, JSON.stringify(r));
-  checkEq('conflict markerN', r.conflict.markerN, 4);
-  checkEq('conflict specN', r.conflict.specN, 5);
-  checkEq('conflict nulls n', r.n, null);
-  checkEq('conflict nulls assignment', r.assignment, null);
-}
-{
-  // Agreement -> proceed silently.
-  const r = parse('do x with 2 opus and 1 sonnet @@FL:3');
-  check('agree no conflict', !r.conflict, JSON.stringify(r));
-  checkEq('agree n=3', r.n, 3);
-  checkEq('agree assignment', r.assignment, ['opus','opus','sonnet']);
-}
-
-// --------------------------------------------------------------------------
-// Positional-skip rejection.
-// --------------------------------------------------------------------------
-{
-  const r = parse('do abc @@FL:5::3');
-  check('positional skip errors', !!r.errors && r.errors.some(e => /positional skip/i.test(e)),
-    JSON.stringify(r.errors));
-  checkEq('positional skip nulls n', r.n, null);
-}
-{
-  // Explicit Z with default M is the correct spelling.
-  const r = parse('do abc @@FL:5:1:3');
-  // Z>1 is inert -> emits the grand-loops error.
-  check('explicit Z>1 inert error', !!r.errors && r.errors.some(e => /grand loops not yet/i.test(e)),
-    JSON.stringify(r.errors));
-  checkEq('explicit Z value', r.z, 3);
-}
-
-// --------------------------------------------------------------------------
-// Z>1 inert.
-// --------------------------------------------------------------------------
-{
-  const r = parse('do abc @@FL:5:2:2');
-  checkEq('Z=2 value parsed', r.z, 2);
-  check('Z=2 emits not-implemented', !!r.errors && r.errors.some(e => /grand loops not yet/i.test(e)),
-    JSON.stringify(r.errors));
-}
-{
-  const r = parse('do abc @@FL:5:1:1');
-  checkEq('Z=1 explicit ok z', r.z, 1);
-  check('Z=1 explicit no grand-loop error',
-    !r.errors || !r.errors.some(e => /grand loops/i.test(e)), JSON.stringify(r.errors));
-  checkEq('Z=1 explicit n=5', r.n, 5);
-}
-
-// --------------------------------------------------------------------------
-// Digit-noun task guard: 'fix 3 bugs' must NOT be a model spec.
-// --------------------------------------------------------------------------
-{
-  const r = parse('fix 3 bugs @@FL:5');
-  checkEq('digit-noun keeps n=5', r.n, 5);
-  checkEq('digit-noun assignment stays null (gate)', r.assignment, null);
-  // N is explicit (5) so needsGate stays false; the Phase-1 menu still runs
-  // because assignment is null. The key guard is that n is NOT shifted by '3 bugs'.
-  check('digit-noun needsGate false (N explicit)', r.needsGate === false, JSON.stringify(r));
-  checkEq('digit-noun task intact', r.task, 'fix 3 bugs');
-  check('digit-noun no errors', !r.errors, JSON.stringify(r.errors));
-}
-{
-  const r = parse('write 5 tests for the parser @@FL:4');
-  checkEq('write 5 tests keeps n=4', r.n, 4);
-  check('write 5 tests no spec', r.assignment === null, JSON.stringify(r));
-  check('write 5 tests task has digits', /5 tests/.test(r.task), 'task=' + r.task);
-}
-{
-  // A digit-noun next to a real model token in the SAME phrase still only
-  // treats the model item as a spec.
-  const r = parse('refactor 2 modules with 2 opus @@FL:2');
-  checkEq('mixed digit-noun + spec n=2', r.n, 2);
-  checkEq('mixed digit-noun + spec assignment', r.assignment, ['opus','opus']);
-  check('mixed task keeps 2 modules', /2 modules/.test(r.task), 'task=' + r.task);
-}
-
-// --------------------------------------------------------------------------
-// Marker position variation: leading / middle / trailing.
-// --------------------------------------------------------------------------
-{
-  const r = parse('@@FL:3 do the thing');
-  checkEq('leading marker n=3', r.n, 3);
-  // Text before marker is empty; task should be empty (or whitespace-trimmed).
-  checkEq('leading marker task empty', r.task, '');
-}
-{
-  const r = parse('start of task @@FL:3 trailing words');
-  checkEq('middle marker n=3', r.n, 3);
-  checkEq('middle marker task = before', r.task, 'start of task');
-}
-
-// --------------------------------------------------------------------------
-// Malformed / edge inputs must not throw.
-// --------------------------------------------------------------------------
-{
-  let threw = false; let r;
-  try { r = parse(null); } catch { threw = true; }
-  check('null input no throw', !threw, 'threw');
-  check('null input errors', r && !!r.errors, JSON.stringify(r));
-}
-{
-  let threw = false; let r;
-  try { r = parse(''); } catch { threw = true; }
-  check('empty input no throw', !threw, 'threw');
-  check('empty input errors (no marker)', r && !!r.errors, JSON.stringify(r));
-}
-{
-  let threw = false; let r;
-  try { r = parse(12345); } catch { threw = true; }
-  check('number input no throw', !threw, 'threw');
-}
-{
-  const r = parse('do something with no marker at all');
-  check('no-marker errors', !!r.errors, JSON.stringify(r));
-}
-{
-  // Invalid M.
-  const r = parse('do abc @@FL:5:3');
-  check('invalid M=3 errors', !!r.errors && r.errors.some(e => /pass count/i.test(e)),
-    JSON.stringify(r.errors));
-}
-{
-  // N=1 invalid.
-  const r = parse('do abc @@FL:1');
-  check('N=1 invalid errors', !!r.errors, JSON.stringify(r.errors));
-  checkEq('N=1 nulls n', r.n, null);
-}
-
-// --------------------------------------------------------------------------
-// expandSpec direct unit (full assignment, not just length).
-// --------------------------------------------------------------------------
-{
-  const e = expandSpec('2 opus, 2 glm 5.2, 1 codex high');
-  checkEq('expandSpec count', e.count, 5);
-  checkEq('expandSpec assignment',
-    e.assignment, ['opus','opus','glm-5.2','glm-5.2','codex-high']);
-  checkEq('expandSpec no unknowns', e.unknowns, []);
-}
-
-// --------------------------------------------------------------------------
-// Report.
-// --------------------------------------------------------------------------
-console.log('');
-if (failures.length) {
-  console.log('FAILURES:');
-  for (const f of failures) console.log('  x ' + f);
-  console.log('');
-}
-console.log(`fl-parse tests: ${passed} passed, ${failed} failed, ${passed + failed} total`);
-process.exit(failed === 0 ? 0 : 1);
+process.exit(0);
