@@ -13,12 +13,14 @@ export const meta = {
 //   task: string,
 //   mode: 'single' | 'two',
 //   runDir: string,                       // absolute base dir for workspaces
+//   glmRunner / localRunner / codexRunner: string,  // bundled runner-script paths (per provider used)
+//   codexTimeoutSecs: number,             // optional wall-clock backstop for codex (default 600)
 //   attempts: [ {                         // one per attempt, length N
 //      label: 'candidate-1',
-//      dispatch: 'anthropic' | 'glm',
-//      model: 'haiku'|'sonnet'|'opus',    // when dispatch=anthropic
-//      agentType: 'farnsworth-glm-5-2',   // when dispatch=glm
-//      displayModel: 'glm-5.2',           // for the report (kept private from judges)
+//      dispatch: 'anthropic' | 'glm' | 'local' | 'codex',
+//      model: 'haiku'|'sonnet'|'opus',    // when dispatch=anthropic (or the exact local/codex model id)
+//      agentType: 'farnsworth-glm-5-2',   // when dispatch=glm/local/codex (the worker agent)
+//      displayModel: 'glm-5.2',           // for the report (kept private from judges); codex: 'codex-high'
 //      r1nudge: string,
 //      r2nudge: string,
 //   } ]
@@ -65,6 +67,17 @@ const GLM_FLAG = {
   'glm-4.7': '--model sonnet',
   'glm-4.5-air': '--model haiku',
 }
+// Codex display model -> the `codex exec` flags selecting it. Codex is pinned to gpt-5.5 (the only
+// model the local ChatGPT-account auth serves; other ids need an OPENAI_API_KEY). The selectable axis
+// is the REASONING EFFORT — codex's real quality lever — set via the model_reasoning_effort config
+// override. Verified-accepted tokens on gpt-5.5: low|medium|high|xhigh ("xhigh" == the UI's "Extra
+// high"; "minimal" is rejected). The runner pins -m so it never falls back to config.toml's default.
+const CODEX_FLAG = {
+  'codex-low': '-m gpt-5.5 -c model_reasoning_effort=low',
+  'codex-medium': '-m gpt-5.5 -c model_reasoning_effort=medium',
+  'codex-high': '-m gpt-5.5 -c model_reasoning_effort=high',
+  'codex-xhigh': '-m gpt-5.5 -c model_reasoning_effort=xhigh',
+}
 const q = s => "'" + String(s).replace(/'/g, "'\\''") + "'" // single-quote shell-escape
 
 // Runner paths for the non-Anthropic providers (passed in via args). Each provider's
@@ -73,6 +86,7 @@ const q = s => "'" + String(s).replace(/'/g, "'\\''") + "'" // single-quote shel
 // self-substitute. GLM has an inline fallback; local always uses its runner.
 const glmRunner = A.glmRunner
 const localRunner = A.localRunner
+const codexRunner = A.codexRunner
 // Per-attempt guards for GLM/local runners (enforced inside the runner scripts):
 //  - max-turns: PRIMARY guard — caps agentic iterations so single-pass attempts can't
 //    grind the write->run->fix loop (which balloons context, esp. on local models).
@@ -82,8 +96,14 @@ const localRunner = A.localRunner
 const glmMaxTurns = Number(A.attemptMaxTurns) > 0 ? Math.floor(Number(A.attemptMaxTurns)) : 30
 const localMaxTurns = Number(A.localMaxTurns) > 0 ? Math.floor(Number(A.localMaxTurns)) : 20
 const attemptTimeout = Number(A.attemptTimeoutSecs) > 0 ? Math.floor(Number(A.attemptTimeoutSecs)) : 300
+// Codex exec is agentic with NO turn cap (no --max-turns flag), so the wall-clock timeout is its ONLY
+// per-attempt backstop and gets its own, roomier default. Override via args.codexTimeoutSecs.
+const codexTimeout = Number(A.codexTimeoutSecs) > 0 ? Math.floor(Number(A.codexTimeoutSecs)) : 600
 const cmdHead = (ws, b) => `mkdir -p ${q(ws)} && cd ${q(ws)} && printf '%s' ${q(b)} > _brief.txt`
 const runnerCmd = (runner, flag, ws, b, maxTurns) => `${cmdHead(ws, b)} && FL_MAX_TURNS=${maxTurns} FL_TIMEOUT_SECS=${attemptTimeout} bash ${q(runner)} ${flag}`
+// Codex reuses cmdHead + the runner but overrides the wall-clock with codexTimeout (no FL_MAX_TURNS:
+// codex has no turn cap, and codex-run.sh ignores it).
+const codexRunnerCmd = (runner, flag, ws, b) => `${cmdHead(ws, b)} && FL_TIMEOUT_SECS=${codexTimeout} bash ${q(runner)} ${flag}`
 
 // Optional shared CONTEXT BUNDLE for known-input tasks (args.contextFiles = [paths/globs]).
 // Concatenate those files ONCE into a single file that every worker reads by path — instead of
@@ -132,6 +152,10 @@ function dispatch(a, ws, guidance, phaseTitle) {
     opts.agentType = nsAgent(a.agentType) // farnsworth-local
     const flag = `--model ${a.model}` // exact local model id, passes straight through to omlx
     prompt = RUNVERBATIM(runnerCmd(localRunner, flag, ws, b, localMaxTurns), ws, '_local_run.log')
+  } else if (a.dispatch === 'codex') {
+    opts.agentType = nsAgent(a.agentType) // farnsworth-codex (one generic agent for every codex effort)
+    const flag = CODEX_FLAG[a.displayModel] || `-m ${a.model}` // gpt-5.5 + reasoning-effort flags -> codex exec
+    prompt = RUNVERBATIM(codexRunnerCmd(codexRunner, flag, ws, b), ws, '_codex_run.log')
   } else {
     // Native Anthropic attempt. NOTE: the workflow agent() primitive exposes no turn/time cap,
     // so (unlike GLM/local) these are bounded only by the single-pass brief. If a future agent()
@@ -236,16 +260,24 @@ async function stageAndValidate(list, reviewDir, phaseTitle) {
   const pool = `${reviewDir}/_pool.md`
   const script = [`mkdir -p ${q(reviewDir)}; : > ${q(pool)}`].concat(list.map(c => {
     const dest = `${reviewDir}/${c.blind}`
-    const log = c.dispatch === 'glm' ? '_glm_run.log' : c.dispatch === 'local' ? '_local_run.log' : ''
+    const log = c.dispatch === 'glm' ? '_glm_run.log'
+              : c.dispatch === 'local' ? '_local_run.log'
+              : c.dispatch === 'codex' ? '_codex_run.log'
+              : ''
     const lp = log ? q(`${c.ws}/${log}`) : ''
-    // FAIL CLOSED (#2): the runner writes its log (with the PROVENANCE line) UNCONDITIONALLY at
-    // startup, so a missing log at this exact path means the runner never ran — a native-solve spoof
-    // or refusal — which must be rejected (P=0), not waved through. Native attempts (no runner) → P=1.
+    // Provider-specific, LINE-ANCHORED marker token. Runners write their FARNSWORTH-<PROV>-* markers at
+    // column 0, so matching '^FARNSWORTH-<PROV>-' (not the greedy 'FARNSWORTH-.*-') stops an attempt whose
+    // OWN deliverable/transcript merely MENTIONS a marker — e.g. a proposal discussing FARNSWORTH-CODEX-ERROR,
+    // echoed mid-line into its log — from false-tripping its own validation. That self-referential
+    // false-negative was real: it invalidated two genuinely-successful GLM proposals about this very feature.
+    // FAIL CLOSED (#2): the PROVENANCE line is written UNCONDITIONALLY at runner startup, so a missing log
+    // here means the runner never ran (native-solve spoof / refusal) → P=0. Native attempts (no runner) → P=1.
+    const tok = c.dispatch === 'glm' ? 'GLM' : c.dispatch === 'local' ? 'LOCAL' : c.dispatch === 'codex' ? 'CODEX' : ''
     const provChk = log
-      ? `if [ -f ${lp} ]; then if grep -q 'FARNSWORTH-.*-PROVENANCE endpoint=' ${lp} && grep -q 'FARNSWORTH-.*-DONE exit=0' ${lp} && ! grep -q 'FARNSWORTH-.*-\\(TIMEOUT\\|ERROR\\)' ${lp}; then P=1; else P=0; fi; else P=0; fi`
+      ? `if [ -f ${lp} ]; then if grep -q '^FARNSWORTH-${tok}-PROVENANCE endpoint=' ${lp} && grep -q '^FARNSWORTH-${tok}-DONE exit=0' ${lp} && ! grep -q '^FARNSWORTH-${tok}-\\(TIMEOUT\\|ERROR\\)' ${lp}; then P=1; else P=0; fi; else P=0; fi`
       : `P=1`
     return `mkdir -p ${q(dest)}; cp -R ${q(c.ws)}/. ${q(dest)}/ 2>/dev/null; ` +
-           `rm -f ${q(dest)}/_brief.txt ${q(dest)}/_glm_run.log ${q(dest)}/_local_run.log; ` +
+           `rm -f ${q(dest)}/_brief.txt ${q(dest)}/_glm_run.log ${q(dest)}/_local_run.log ${q(dest)}/_codex_run.log ${q(dest)}/_codex_last.txt; ` +
            `D=$(find ${q(dest)} -type f 2>/dev/null | grep -c .); ${provChk}; ` +
            `if [ "$D" -gt 0 ] && [ "$P" -eq 1 ]; then { echo "===== Candidate ${c.blind} ====="; cat ${q(dest)}/* 2>/dev/null; echo; } >> ${q(pool)}; fi; ` +
            `echo "FLV ${c.blind} d=$([ "$D" -gt 0 ] && echo 1 || echo 0) p=$P"`
@@ -267,6 +299,10 @@ async function stageAndValidate(list, reviewDir, phaseTitle) {
 // #6 + #7: never silently carry the wrong artifact or trust an off-spec ranking — normalize the
 // judge's winner/ranking against the REAL candidate labels and repair to a full permutation.
 function reconcile(result, labels) {
+  // Null-guard: agent() returns null if the judge dies on a terminal API error (or is skipped). Surface
+  // that as a clear, catchable error instead of a cryptic "null is not an object" — judge() retries once
+  // then degrades to a clean __failed partial result rather than crashing the (fully-paid) run.
+  if (!result || typeof result !== 'object') throw new Error('judge returned no structured result (null)')
   const set = new Set(labels)
   const norm = s => String(s || '').toUpperCase().replace(/[^A-Z]/g, '').charAt(0)
   let ranking = [...new Set((result.ranking || []).map(norm).filter(x => set.has(x)))]
