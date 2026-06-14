@@ -2,8 +2,12 @@
   "name": "uv-python-manager",
   "version": "1.0.0",
   "description": "Standardize Python development using UV - a fast, unified package and project manager",
-  "author": "Rob Anderson",
+  "author": {
+    "name": "Rob Anderson"
+  },
   "components": {
-    "skills": ["uv-python-manager"]
+    "skills": [
+      "uv-python-manager"
+    ]
   }
 }

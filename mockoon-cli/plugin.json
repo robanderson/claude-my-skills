@@ -6,8 +6,17 @@
     "name": "Rob Anderson"
   },
   "license": "MIT",
-  "keywords": ["api", "mock", "proxy", "testing", "debugging", "mockoon"],
+  "keywords": [
+    "api",
+    "mock",
+    "proxy",
+    "testing",
+    "debugging",
+    "mockoon"
+  ],
   "components": {
-    "skills": ["mockoon-cli"]
+    "skills": [
+      "mockoon-cli"
+    ]
   }
 }
