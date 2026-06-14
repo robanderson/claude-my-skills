@@ -22,7 +22,6 @@ The Phase 1 selection maps to these. There are two families with two different d
 |---------------|--------------------|--------------------------------|
 | `glm-5.2`     | `--model opus`     | strongest, 1M context          |
 | `glm-5.1`     | `--model glm-5.1`  | passed through directly        |
-| `glm-5`       | `--model glm-5`    | passed through directly        |
 | `glm-4.7`     | `--model sonnet`   |                                |
 | `glm-4.5-air` | `--model haiku`    | fastest, cheapest              |
 
@@ -49,8 +48,8 @@ Workflow({ scriptPath: "<plugin-root>/workflows/tournament.mjs", args: <ARGS> })
   runDir: "<absolute run dir>",          // e.g. <plugin>/.runs/<run-id>
   glmRunner: "<plugin-root>/bin/glm-run.sh",      // REQUIRED if any attempt is GLM
   localRunner: "<plugin-root>/bin/local-run.sh",  // REQUIRED if any attempt is Local
-  attemptMaxTurns: 8,                    // optional iteration cap for GLM attempts; default 8
-  localMaxTurns: 4,                      // optional iteration cap for LOCAL attempts; default 4 (tighter)
+  attemptMaxTurns: 30,                    // optional iteration cap for GLM attempts; default 30
+  localMaxTurns: 20,                      // optional iteration cap for LOCAL attempts; default 20
   attemptTimeoutSecs: 300,               // optional wall-clock backstop (GLM/local); default 300
   attempts: [                            // one per attempt, length N
     { label: "candidate-1",
@@ -80,7 +79,6 @@ Workflow({ scriptPath: "<plugin-root>/workflows/tournament.mjs", args: <ARGS> })
 |-----------|-----------|
 | glm-5.2 | `farnsworth-loop:farnsworth-glm-5-2` |
 | glm-5.1 | `farnsworth-loop:farnsworth-glm-5-1` |
-| glm-5 | `farnsworth-loop:farnsworth-glm-5` |
 | glm-4.7 | `farnsworth-loop:farnsworth-glm-4-7` |
 | glm-4.5-air | `farnsworth-loop:farnsworth-glm-4-5-air` |
 
@@ -100,7 +98,7 @@ Anthropic attempts pass `dispatch:"anthropic"` + `model`; the workflow spawns th
 
 **Per-attempt guards (two layers).** Both runner scripts bound the nested `claude` call:
 
-1. **`--max-turns` (primary, iteration-based).** Passed from `FL_MAX_TURNS`: **GLM = `attemptMaxTurns` (default 8); local = `localMaxTurns` (default 4, tighter).** This caps agentic turns, so an attempt that tries to grind the write→run→fix loop is stopped cleanly. Crucially, **the deliverable written before the cap is preserved** — hitting the cap truncates the grind but keeps the best-so-far file (claude prints `Error: Reached max turns (N)` and exits non-zero; the saved file is still graded). Local gets the tighter cap because weaker local models (observed clearly on Qwen) ignore "single pass" and burn turns **rewriting the art on self-critique** ("that's a cow face… proportions are off… let me realign") and **fixing their own buggy code** (bad raw-string escaping; Linux-only `cat -A` on macOS). The hard-stop brief (below) curbs the behaviour at the source; the tight cap is the backstop. A clean single pass under the hard-stop brief is ~2 turns (Write → stop), so 4 is ample.
+1. **`--max-turns` (primary, iteration-based).** Passed from `FL_MAX_TURNS`: **GLM = `attemptMaxTurns` (default 30); local = `localMaxTurns` (default 20).** This caps agentic turns, so an attempt that tries to grind the write→run→fix loop is stopped cleanly. Crucially, **the deliverable written before the cap is preserved** — hitting the cap truncates the grind but keeps the best-so-far file (claude prints `Error: Reached max turns (N)` and exits non-zero; the saved file is still graded). Local gets the tighter cap because weaker local models (observed clearly on Qwen) ignore "single pass" and burn turns **rewriting the art on self-critique** ("that's a cow face… proportions are off… let me realign") and **fixing their own buggy code** (bad raw-string escaping; Linux-only `cat -A` on macOS). The hard-stop brief (below) curbs the behaviour at the source; the tight cap is the backstop. A clean single pass under the hard-stop brief is ~2 turns (Write → stop); the caps are generous runaway backstops, sized up because substantial writing deliverables legitimately need more turns than a tiny script.
 2. **Wall-clock timeout (backstop, time-based).** Portable perl `alarm` → TERM/KILL (macOS has no `timeout`/`gtimeout`), from `FL_TIMEOUT_SECS` (workflow `attemptTimeoutSecs`, default 300s). Catches a *single* hung or pathologically slow turn that `--max-turns` can't (one turn never returning). On fire it logs `FARNSWORTH-{GLM,LOCAL}-TIMEOUT secs=N` and exits 124. Scale to task complexity (~180s small, 300s+ heavier).
 
 Either way a bounded-out attempt is just an honest failure and the round proceeds over the survivors. These cover the runner-based (GLM/local) attempts — native Anthropic attempts have no shell hook, but they are fast and bounded by the single-pass brief. The **single-pass brief is the real fix**; these two are the safety net.
@@ -219,6 +217,8 @@ A quick liveness check before a big round is cheap: `glm -p "reply OK" --model h
 - If a sub-agent fails or returns nothing, note it and continue. A round proceeds over the attempts that succeeded, and the report states which attempt failed.
 
 ## Dispatching the Opus passes
+
+**Stage + validate before judging (engine, both passes).** A candidate's live workspace is NOT shown to the judge — it contains `_brief.txt` and `_glm_run.log` / `_local_run.log`, and those provenance logs name the provider/model (`flag=--model opus` = glm-5.2, the exact local id, etc.) while Anthropic workspaces have no such log. Pointing a "blind" judge at the raw workspace therefore leaks identity, and in two pass the round-1-vs-round-2 path also unmasks the carryover. So `tournament.mjs` first stages each candidate's **deliverable-only** files (names not starting with `_`) into a clean `review-1/<blind>/` (and `review-final/<blind>/`) directory and hands the judge those paths — no logs, no briefs, no round in the path. The same step **validates**: a candidate with no deliverable file, or a GLM/local attempt missing its provenance marker, is excluded from the pool *before* the judge runs (and recorded in the mapping as `valid:false` with a reason), rather than ranked as a phantom. The judge's returned winner/ranking are then reconciled against the real blind-label set (normalised, repaired to a full permutation) so an off-spec label never silently carries the wrong artifact.
 
 **Phase 3 reviewer (both modes):** collect each first-round deliverable and self-summary, assign blind labels (Candidate A, B, ...) in a fixed order, keep a private label-to-model mapping, and spawn one Opus agent with the candidates and `references/review-rubric.md`. It returns the per-candidate pros and cons, the ranking, and the winner. In **two pass** it additionally returns the two distilled lists (positives to consider, challenges to avoid); in **single pass** those lists are not needed. Do not pass model identities to it.
 

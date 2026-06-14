@@ -1,6 +1,6 @@
 export const meta = {
-  name: 'farnsworth-tournament',
-  description: 'Farnsworth Loop tournament: parallel attempts (Anthropic native or GLM via wrapper agents) judged blind by Anthropic Opus; two-pass adds a guided round and a final rank.',
+  name: 'Farnsworth Loop',
+  description: 'Farnsworth Loop — a refined, multi-model best-of-N refinement loop: N parallel attempts judged blind by Anthropic Opus; two-pass adds a guided round and a final rank.',
   phases: [
     { title: 'Round 1' },
     { title: 'Review' },
@@ -59,7 +59,6 @@ Rules:
 const GLM_FLAG = {
   'glm-5.2': '--model opus',
   'glm-5.1': '--model glm-5.1',
-  'glm-5': '--model glm-5',
   'glm-4.7': '--model sonnet',
   'glm-4.5-air': '--model haiku',
 }
@@ -77,8 +76,8 @@ const localRunner = A.localRunner
 //  - timeout: wall-clock backstop for a single hung/slow turn.
 // GLM gets a roomier cap; local models run a tighter cap because they tend to ignore
 // "single pass" and burn turns on a verify-and-polish loop (observed on Qwen).
-const glmMaxTurns = Number(A.attemptMaxTurns) > 0 ? Math.floor(Number(A.attemptMaxTurns)) : 8
-const localMaxTurns = Number(A.localMaxTurns) > 0 ? Math.floor(Number(A.localMaxTurns)) : 4
+const glmMaxTurns = Number(A.attemptMaxTurns) > 0 ? Math.floor(Number(A.attemptMaxTurns)) : 30
+const localMaxTurns = Number(A.localMaxTurns) > 0 ? Math.floor(Number(A.localMaxTurns)) : 20
 const attemptTimeout = Number(A.attemptTimeoutSecs) > 0 ? Math.floor(Number(A.attemptTimeoutSecs)) : 300
 const cmdHead = (ws, b) => `mkdir -p ${q(ws)} && cd ${q(ws)} && printf '%s' ${q(b)} > _brief.txt`
 const runnerCmd = (runner, flag, ws, b, maxTurns) => `${cmdHead(ws, b)} && FL_MAX_TURNS=${maxTurns} FL_TIMEOUT_SECS=${attemptTimeout} bash ${q(runner)} ${flag}`
@@ -88,7 +87,7 @@ function glmInline(flag, ws, b) {
     `echo "FARNSWORTH-GLM-PROVENANCE endpoint=api.z.ai flag=${flag}" >> _glm_run.log && ` +
     `ANTHROPIC_BASE_URL="https://api.z.ai/api/anthropic" ANTHROPIC_AUTH_TOKEN="$ZAI_API_KEY" ` +
     `ANTHROPIC_DEFAULT_OPUS_MODEL="glm-5.2[1m]" ANTHROPIC_DEFAULT_SONNET_MODEL="glm-4.7" ANTHROPIC_DEFAULT_HAIKU_MODEL="glm-4.5-air" ` +
-    `claude -p "$(cat _brief.txt)" ${flag} --allowedTools "Bash Read Write Edit" >> _glm_run.log 2>&1; ` +
+    `claude -p "$(cat _brief.txt)" ${flag} --max-turns ${glmMaxTurns} --permission-mode acceptEdits --allowedTools "Bash Read Write Edit" >> _glm_run.log 2>&1; ` +
     `echo "FARNSWORTH-GLM-DONE exit=$?" >> _glm_run.log; tail -20 _glm_run.log`
 }
 
@@ -114,10 +113,15 @@ function dispatch(a, ws, guidance, phaseTitle) {
     const flag = `--model ${a.model}` // exact local model id, passes straight through to omlx
     prompt = RUNVERBATIM(runnerCmd(localRunner, flag, ws, b, localMaxTurns), ws, '_local_run.log')
   } else {
+    // Native Anthropic attempt. NOTE: the workflow agent() primitive exposes no turn/time cap,
+    // so (unlike GLM/local) these are bounded only by the single-pass brief. If a future agent()
+    // gains a maxTurns option, pass an Anthropic-equivalent cap here for symmetry.
     opts.model = a.model
     prompt = b
   }
-  return agent(prompt, opts).then(res => ({ label: a.label, displayModel: a.displayModel, ws, res })).catch(() => null)
+  return agent(prompt, opts)
+    .then(res => ({ label: a.label, displayModel: a.displayModel, dispatch: a.dispatch || 'anthropic', ws, res }))
+    .catch(e => { log(`attempt ${a.label} (${a.displayModel}) errored: ${String(e).slice(0, 100)}`); return null }) // don't swallow silently
 }
 
 function judgePrompt(kind, blindList, guidanceWanted) {
@@ -130,7 +134,7 @@ function judgePrompt(kind, blindList, guidanceWanted) {
 Task that every candidate was given:
 ${task}
 
-Candidates (read the deliverable file(s) in each directory; if it is code, RUN it to see the real output, and judge the real output — not any self-summary):
+Candidates (each directory below contains ONLY that candidate's deliverable file(s) — read them; if it is runnable code, you may run it with a sensible timeout to see the real output, and judge the real output — not any self-summary):
 ${items}
 
 Score each candidate against criteria suited to the task (for code: correctness, meets stated constraints, completeness, edge cases, readability; adapt for non-code). Give concrete, specific pros and cons per candidate. Rank them all. Name the single winner with reasoning.${guidanceBlock}
@@ -180,22 +184,70 @@ const RANK_SCHEMA = {
   required: ['candidates', 'ranking', 'winner', 'reasoning'],
 }
 
+// ---- helpers ----
+// #1 + #2: stage each candidate's DELIVERABLE-ONLY files (names not starting with '_') into a
+// clean per-blind dir, so the judge never sees provenance logs / briefs (which name the
+// provider/model) or the round-1-vs-round-2 path (which would unmask the carried-over winner).
+// Also report which candidates actually saved a deliverable and (glm/local) a valid provenance
+// marker — so empty/faked attempts are excluded BEFORE judging, not flagged after.
+async function stageAndValidate(list, reviewDir, phaseTitle) {
+  const script = list.map(c => {
+    const dest = `${reviewDir}/${c.blind}`
+    const log = c.dispatch === 'glm' ? '_glm_run.log' : c.dispatch === 'local' ? '_local_run.log' : ''
+    const lp = log ? q(`${c.ws}/${log}`) : ''
+    // provenance: only fail if a runner log is present but lacks the marker (a carried-over winner
+    // staged from review-1 has no log and was already validated upstream → treat as ok).
+    const provChk = log ? `if [ -f ${lp} ]; then if grep -q FARNSWORTH- ${lp}; then P=1; else P=0; fi; else P=1; fi` : `P=1`
+    return `mkdir -p ${q(dest)}; cp -R ${q(c.ws)}/[!_]* ${q(dest)}/ 2>/dev/null; ` +
+           `D=$(ls -A ${q(dest)} 2>/dev/null | grep -c .); ${provChk}; ` +
+           `echo "FLV ${c.blind} d=$([ "$D" -gt 0 ] && echo 1 || echo 0) p=$P"`
+  }).join('\n')
+  const out = await agent(
+    `Run this exact shell script in ONE Bash call, then reply with the script's stdout verbatim (the FLV lines) and nothing else — do not summarize or add commentary:\n\n${script}`,
+    { model: 'haiku', phase: phaseTitle, label: 'stage' }
+  ).catch(() => '')
+  const v = {}
+  for (const m of String(out).matchAll(/FLV (\w+) d=(\d) p=(\d)/g)) v[m[1]] = { d: m[2] === '1', p: m[3] === '1' }
+  const parsed = Object.keys(v).length > 0
+  return list.map(c => {
+    const r = v[c.blind] || { d: true, p: true }
+    const valid = !parsed || (r.d && r.p)
+    return { ...c, ws: `${reviewDir}/${c.blind}`, valid, failReason: valid ? '' : (!r.d ? 'no deliverable saved' : 'missing provenance marker') }
+  })
+}
+
+// #6 + #7: never silently carry the wrong artifact or trust an off-spec ranking — normalize the
+// judge's winner/ranking against the REAL candidate labels and repair to a full permutation.
+function reconcile(result, labels) {
+  const set = new Set(labels)
+  const norm = s => String(s || '').toUpperCase().replace(/[^A-Z]/g, '').charAt(0)
+  let ranking = [...new Set((result.ranking || []).map(norm).filter(x => set.has(x)))]
+  for (const l of labels) if (!ranking.includes(l)) ranking.push(l)
+  let winner = norm(result.winner)
+  if (!set.has(winner)) { winner = ranking[0]; log(`judge winner "${result.winner}" did not match a candidate; using top of ranking (${winner})`) }
+  return { ...result, winner, ranking }
+}
+
+// rotate to decorrelate the blind letter from dispatch order
+const blindLabel = (list, rot) => list.map((_, i) => list[(i + rot) % list.length]).map((c, i) => ({ ...c, blind: LABELS[i] }))
+
 // ---- Round 1 ----
 phase('Round 1')
 log(`Round 1: ${attempts.length} attempts (${attempts.map(a => a.displayModel).join(', ')})`)
 const r1 = (await parallel(attempts.map(a => () => dispatch(a, `${runDir}/round-1/${a.label}`, null, 'Round 1')))).filter(Boolean)
-if (!r1.length) return { error: 'all round-1 attempts failed' }
-
-// blind-label round 1 (rotate by 1 to decorrelate label order from dispatch order)
-const rot = r1.map((_, i) => r1[(i + 1) % r1.length])
-const blind1 = rot.map((c, i) => ({ blind: LABELS[i], ws: c.ws, displayModel: c.displayModel, label: c.label }))
+if (!r1.length) return { error: 'all round-1 attempts failed (dispatch errors)' }
 
 phase('Review')
-const review = await agent(
-  judgePrompt('reviewer', blind1, mode === 'two'),
-  { model: 'opus', schema: REVIEW_SCHEMA, phase: 'Review', label: 'review' }
+const staged1 = await stageAndValidate(blindLabel(r1, 1), `${runDir}/review-1`, 'Review')
+const blind1 = staged1.filter(c => c.valid)
+const r1mapping = staged1.map(c => ({ candidate: c.blind, model: c.displayModel, valid: c.valid, ...(c.valid ? {} : { failReason: c.failReason }) }))
+if (!blind1.length) return { mode, n: attempts.length, error: 'no valid round-1 deliverables', round1: { mapping: r1mapping } }
+
+const review = reconcile(
+  await agent(judgePrompt('reviewer', blind1, mode === 'two'),
+    { model: 'opus', schema: mode === 'two' ? REVIEW_SCHEMA : RANK_SCHEMA, phase: 'Review', label: 'review' }),
+  blind1.map(c => c.blind)
 )
-const r1mapping = blind1.map(c => ({ candidate: c.blind, model: c.displayModel, ws: c.ws }))
 
 if (mode === 'single') {
   return { mode, n: attempts.length, round1: { mapping: r1mapping, review } }
@@ -207,20 +259,21 @@ phase('Round 2')
 log(`Round 2: ${attempts.length} guided attempts; carrying over round-1 winner (${winner1.displayModel})`)
 const r2 = (await parallel(attempts.map(a => () => dispatch(a, `${runDir}/round-2/${a.label}`, review.guidance, 'Round 2')))).filter(Boolean)
 
-// final pool = round-2 attempts + saved round-1 winner
+// final pool = round-2 attempts + the carried-over round-1 winner. Staging erases the round path,
+// so the judge cannot tell which finalist is the carryover.
 const pool = [
-  ...r2.map(c => ({ ws: c.ws, displayModel: c.displayModel, round: 2 })),
-  { ws: winner1.ws, displayModel: winner1.displayModel, round: 1 },
+  ...r2.map(c => ({ ws: c.ws, displayModel: c.displayModel, dispatch: c.dispatch, round: 2 })),
+  { ws: winner1.ws, displayModel: winner1.displayModel, dispatch: winner1.dispatch, round: 1 },
 ]
-const rotF = pool.map((_, i) => pool[(i + 2) % pool.length])
-const blindF = rotF.map((c, i) => ({ blind: LABELS[i], ws: c.ws, displayModel: c.displayModel, round: c.round }))
-
 phase('Final rank')
-const finalRank = await agent(
-  judgePrompt('final ranker', blindF, false),
-  { model: 'opus', schema: RANK_SCHEMA, phase: 'Final rank', label: 'final-rank' }
+const stagedF = await stageAndValidate(blindLabel(pool, 2), `${runDir}/review-final`, 'Final rank')
+const blindF = stagedF.filter(c => c.valid)
+const finalRank = reconcile(
+  await agent(judgePrompt('final ranker', blindF, false),
+    { model: 'opus', schema: RANK_SCHEMA, phase: 'Final rank', label: 'final-rank' }),
+  blindF.map(c => c.blind)
 )
-const finalMapping = blindF.map(c => ({ candidate: c.blind, model: c.displayModel, round: c.round, ws: c.ws }))
+const finalMapping = stagedF.map(c => ({ candidate: c.blind, model: c.displayModel, round: c.round, valid: c.valid, ...(c.valid ? {} : { failReason: c.failReason }) }))
 
 return {
   mode, n: attempts.length,

@@ -20,16 +20,33 @@ Pool A changes the path an attempt takes. Pool B changes the target it aims at. 
 
 These vary where an attempt starts and how it proceeds, not what counts as a good answer. Because they do not move the success criteria, the reviewer does not need to know which nudge an attempt received, so blind review is preserved.
 
-1. from first principles
-2. starting from the data model or core types
-3. starting from the public interface or CLI surface
-4. test-first: sketch the tests before the implementation
-5. simplest thing that could work first, then refine
-6. sketch two approaches briefly, then commit to the strongest
-7. happy path first, then harden
-8. edge cases first, then the core
-9. write a short plan before any code
-10. as if it will be maintained by someone else in a year
+**Pool A is task-type-aware.** The default nudges below are code-flavoured ("data model", "test-first") and become nonsense prepended to a prose/analysis/decision task. So tag each nudge by domain and draw only from the applicable set. Detect the task type with a light heuristic at draw time — if the task says write a program/function/script/test/code (or names a language), use **code**; otherwise use **prose**. When N exceeds the chosen set, top up from the `any` set.
+
+**Code (default for code tasks):**
+1. from first principles `[any]`
+2. starting from the data model or core types `[code]`
+3. starting from the public interface or CLI surface `[code]`
+4. test-first: sketch the tests before the implementation `[code]`
+5. simplest thing that could work first, then refine `[any]`
+6. sketch two approaches briefly, then commit to the strongest `[any]`
+7. happy path first, then harden `[code]`
+8. edge cases first, then the core `[code]`
+9. write a short plan before any code `[any]`
+10. as if it will be maintained by someone else in a year `[code]`
+
+**Prose / analysis / decision tasks (use these instead for non-code):**
+1. from first principles — question the premises `[any]`
+2. lead with your strongest claim, then support it
+3. structure it as question → answer
+4. draft the conclusion first, then justify it backwards
+5. write for a smart, skeptical reader who will push back
+6. favour concrete examples over abstractions
+7. start from the audience and what they need to walk away with
+8. cover the strongest counter-argument head-on
+9. simplest framing that could work first, then deepen `[any]`
+10. sketch two angles briefly, then commit to the strongest `[any]`
+
+Items tagged `[any]` work for either domain and are the top-up pool. Keep the sampling rules below (draw without replacement, bias same-model siblings apart) unchanged; they apply within the chosen set.
 
 ### Pool B: objective lenses (opt-in, logged)
 

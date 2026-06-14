@@ -7,7 +7,7 @@ set -uo pipefail
 FLAG="${*:---model glm-5}"
 LOG=_glm_run.log
 TIMEOUT="${FL_TIMEOUT_SECS:-300}"   # wall-clock backstop (seconds)
-MAXTURNS="${FL_MAX_TURNS:-8}"       # primary guard: cap agentic iterations (single-pass)
+MAXTURNS="${FL_MAX_TURNS:-30}"       # primary guard: cap agentic iterations (single-pass)
 if [ -z "${ZAI_API_KEY:-}" ]; then echo "FARNSWORTH-GLM-ERROR ZAI_API_KEY missing" | tee -a "$LOG"; exit 3; fi
 [ -f _brief.txt ] || { echo "FARNSWORTH-GLM-ERROR _brief.txt missing" | tee -a "$LOG"; exit 4; }
 
