@@ -30,6 +30,53 @@ The `--model opus/sonnet/haiku` aliases resolve to GLM models only because the `
 
 The Phase 3 reviewer (single pass and two pass) and the final ranker (Phase 5, two pass only) are **always Anthropic Opus**, dispatched via the Task tool — never GLM. Holding the judge fixed keeps scoring consistent across attempts and across rounds.
 
+## Dynamic-workflow dispatch (preferred backend)
+
+The bundled workflow `workflows/tournament.mjs` (plugin root) runs the whole tournament — parallel attempts, blind Opus review, and (two pass) the guided round and final rank — as one resumable, `/workflows`-monitored run. Invoke it from the skill's Phase 2 once the interactive gates are done:
+
+```
+Workflow({ scriptPath: "<plugin-root>/workflows/tournament.mjs", args: <ARGS> })
+```
+
+**ARGS shape** (the skill builds this from the model gate + diversity draw):
+
+```
+{
+  task: "<exact task text>",
+  mode: "single" | "two",
+  runDir: "<absolute run dir>",          // e.g. <plugin>/.runs/<run-id>
+  attempts: [                            // one per attempt, length N
+    { label: "candidate-1",
+      dispatch: "anthropic",             // native, runs in-process
+      model: "haiku",                    // opus | sonnet | haiku
+      displayModel: "haiku",             // for the report; NOT shown to judges
+      r1nudge: "<Pool A nudge>", r2nudge: "<fresh Pool A nudge>" },
+    { label: "candidate-2",
+      dispatch: "glm",                   // runs via a wrapper agent
+      agentType: "farnsworth-glm-5-2",   // one of the bundled GLM worker agents
+      displayModel: "glm-5.2",
+      r1nudge: "...", r2nudge: "..." }
+    // ...
+  ]
+}
+```
+
+**Model → agentType map** for GLM attempts (the wrapper bakes the `glm` flag, see the table above):
+
+| GLM model | agentType |
+|-----------|-----------|
+| glm-5.2 | `farnsworth-glm-5-2` |
+| glm-5.1 | `farnsworth-glm-5-1` |
+| glm-5 | `farnsworth-glm-5` |
+| glm-4.7 | `farnsworth-glm-4-7` |
+| glm-4.5-air | `farnsworth-glm-4-5-air` |
+
+Anthropic attempts pass `dispatch:"anthropic"` + `model`; the workflow spawns them natively. The workflow blind-labels candidates, the Opus reviewer/ranker **reads and runs each candidate's files** from its workspace (judges never receive model identities), and the script returns `{ round1.mapping, round1.review, guidance?, final.mapping, final.rank, final.winnerRound }` — everything Phase 6 needs to unblind and report.
+
+**Why the GLM wrapper agents exist:** a subagent inherits the session's Anthropic provider, so `model: glm-5.2` fails (verified: the Anthropic endpoint returns "model … may not exist"). Each `farnsworth-glm-*` agent is a cheap Anthropic (`haiku`) driver that shells out to `claude` pointed at z.ai — it must faithfully relay the GLM agent's output and never solve the task itself. GLM tokens bill the z.ai plan and do not appear in Anthropic usage, but each attempt still shows as a node in `/workflows`.
+
+If dynamic workflows are unavailable, use the manual Task-tool + `glm`-CLI fallback below.
+
 ## Run layout
 
 One run directory, with separate round folders and isolated per-candidate workspaces. Isolation is not optional: parallel agents writing to a shared path produce race conditions and overwritten files.

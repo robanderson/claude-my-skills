@@ -1,6 +1,6 @@
 ---
 name: farnsworth-loop
-description: "Run a Farnsworth Loop tournament in one of two modes. First ask the user which model quality to use for the attempts (Anthropic Opus, Sonnet, Haiku; a GLM z.ai model via the glm CLI; or Mixed per-attempt). SINGLE PASS: produce N independent solutions in parallel, then a blind Opus reviewer scores them, lists pros and cons, ranks them, and names a winner. TWO PASS: the same first round, but the Opus reviewer also distils what worked and what failed into guidance; the losing attempts are discarded, a second round of N fresh attempts is run with that guidance (positives to emulate, pitfalls to avoid), the saved round one winner is added back, and a final Opus ranker picks the overall winner. Trigger on the explicit marker 'farnsworth loop:N' (single pass, N attempts) or 'farnsworth loop:N:2' (two pass, N attempts per round), case-insensitive, with or without a leading colon and surrounding spaces, e.g. 'do abc :farnsworth loop:5' or 'do abc: farnsworth loop:5:2'. The optional third segment is the number of passes: omitted or 1 means single pass, 2 means two pass."
+description: "Run a Farnsworth Loop tournament in one of two modes. First ask the user which model quality to use for the attempts (Anthropic Opus, Sonnet, Haiku; a GLM z.ai model via the glm CLI; or Mixed per-attempt). SINGLE PASS: produce N independent solutions in parallel, then a blind Opus reviewer scores them, lists pros and cons, ranks them, and names a winner. TWO PASS: the same first round, but the Opus reviewer also distils what worked and what failed into guidance; the losing attempts are discarded, a second round of N fresh attempts is run with that guidance (positives to emulate, pitfalls to avoid), the saved round one winner is added back, and a final Opus ranker picks the overall winner. Trigger whenever the user's message contains a sigil of the form @@FL:N:M (for example @@FL:5 , @@FL:5:2 , @@fl:7:2 ), where N is the number of attempts per round and M is the number of passes (omitted or 1 = single pass, 2 = two pass); the text before the sigil is the task. ALSO trigger on the prose marker 'farnsworth loop:N' (single pass) or 'farnsworth loop:N:2' (two pass), e.g. 'do abc :farnsworth loop:5' or 'do abc: farnsworth loop:5:2'. All forms are case-insensitive with optional spaces around the colons. Also trigger when the user clearly asks for a farnsworth loop / generate-and-rank tournament even without a marker."
 ---
 
 # Farnsworth Loop
@@ -24,20 +24,26 @@ This gate is mandatory **even when the environment cannot truly run separate-mod
 
 ## Phase 0: Parse the invocation and detect the mode
 
-The trigger is a task followed by a `farnsworth loop` marker of the form `farnsworth loop:N` or `farnsworth loop:N:P`. The marker may carry a leading colon and arbitrary surrounding spaces (e.g. `... :farnsworth loop:5`, `...: farnsworth loop:5:2`). Match it case-insensitively. Parse three things:
+The trigger is a task plus a marker in one of two equivalent forms:
 
-- **Task.** Everything before the marker. Treat it verbatim, stripping any trailing separator colon (so `do abc:` and `do abc :` both yield the task `do abc`). Every attempt in every round receives the identical task, so the comparison stays fair.
-- **N.** The first integer after `farnsworth loop:` — the number of independent attempts **per round**.
-- **Mode.** Decided by the optional **second** integer P (the pass count):
-  - `farnsworth loop:N` with no second segment, or `farnsworth loop:N:1` → **single pass**.
-  - `farnsworth loop:N:2` → **two pass**.
-  - P values other than 1 or 2 are invalid — ask the user to clarify (only single and two pass exist).
+- **Sigil (preferred):** `@@FL:N:M` — e.g. `@@FL:5`, `@@FL:5:2`, `@@fl:7:2`. `N` = attempts per round, `M` = passes (omitted or `1` = single, `2` = two pass).
+- **Prose marker:** `farnsworth loop:N` or `farnsworth loop:N:P`, optionally with a leading colon (e.g. `... :farnsworth loop:5`, `...: farnsworth loop:5:2`).
 
-If the user clearly describes the loop's generate-and-rank tournament but omits the exact marker, you may still run it: infer single vs two pass from whether they describe a learning round, ask for N and the model if not given, then proceed. Do not nudge the user toward two pass when single pass is what was asked.
+Both are case-insensitive with optional spaces around the colons; the text **before** the marker/sigil is the task. Parse three things:
+
+- **Task.** Everything before the marker/sigil. Treat it verbatim, stripping any trailing separator colon (so `do abc:` and `do abc :` both yield the task `do abc`). Every attempt in every round receives the identical task, so the comparison stays fair.
+- **N.** The first integer of the marker (`@@FL:`**N**`:M` or `farnsworth loop:`**N**) — independent attempts **per round**.
+- **Mode.** Decided by the optional **second** integer (M / P, the pass count):
+  - no second segment, or `:1` → **single pass**.
+  - `:2` → **two pass**.
+  - any other value → invalid; ask the user to clarify (only single and two pass exist).
+
+If the user clearly describes the loop's generate-and-rank tournament but omits any marker, you may still run it: infer single vs two pass from whether they describe a learning round, ask for N and the model if not given, then proceed. Do not nudge the user toward two pass when single pass is what was asked.
 
 **Examples:**
-- Input: `do abc :farnsworth loop:5` → task = "do abc", N = 5, mode = **single pass** (5 attempts, 1 Opus review).
-- Input: `do abc: farnsworth loop:5:2` → task = "do abc", N = 5, mode = **two pass** (5 attempts in round one, 5 in round two, plus 1 carried-over winner = 11 candidates touched).
+- Input: `do abc @@FL:5` → task = "do abc", N = 5, mode = **single pass** (5 attempts, 1 Opus review).
+- Input: `do abc @@FL:5:2` (or `do abc: farnsworth loop:5:2`) → task = "do abc", N = 5, mode = **two pass** (5 + 5 attempts plus 1 carried-over winner = 11 candidates touched).
+- Input: `make a hangman game @@fl:7:2` → task = "make a hangman game", N = 7, mode = **two pass**.
 - Input: `write a python program for hangman game, farnsworth loop:4` → task = "write a python program for hangman game", N = 4, mode = **single pass**.
 
 Validate N before continuing:
@@ -91,14 +97,19 @@ Before spending tokens, show the plan and get a go-ahead:
   - **Single pass:** roughly N independent attempts plus one Opus review.
   - **Two pass:** roughly 2N independent attempts plus two Opus passes (the round one review and the final rank), so token use is about double single pass. Recommend a small N on the first run to gauge usage.
 
-On confirmation, fan out **N sub-agents in parallel** for the first round, following `references/orchestration.md`. Apply a fresh diversity draw for this round (Phase 1b). The essential rules:
+On confirmation, dispatch the whole tournament. **Two dispatch backends exist — prefer dynamic workflows:**
 
-- **Identical brief plus one modifier.** Every sub-agent receives the same task text, differing only by its drawn diversity modifier, so any divergence is attributable to it. No agent is told it is competing, judged, or which attempt it is.
-- **Isolation.** Each sub-agent gets its own workspace (for example `farnsworth-loop/<run-id>/round-1/candidate-<i>/`). Isolated workspaces and atomic per-candidate outputs prevent the race conditions and clobbered files that parallel writes to one location cause.
-- **No cross-talk.** Sub-agents must not see each other's output. Independence is the point.
-- **Self-summary.** Each sub-agent returns its complete work product plus a 2 to 4 sentence note on its approach and tradeoffs.
+- **Preferred — dynamic workflows.** Invoke the bundled Workflow script `workflows/tournament.mjs` (at the plugin root, i.e. `../../workflows/tournament.mjs` relative to this skill's base dir) via the `Workflow` tool, passing `args` (see `references/orchestration.md` for the exact shape: task, mode, runDir, and the per-attempt list with each attempt's dispatch path, model/agentType, and round-1/round-2 nudges). The workflow runs Phases 2–5 deterministically — parallel attempts, the blind Opus review, and (two pass) round two and the final rank — and you can watch it live in `/workflows`. It returns the structured mapping + rankings you report in Phase 6. This is opt-in orchestration: the harness will show a confirm at first dispatch. **Anthropic attempts run native; GLM attempts run through the bundled wrapper agents** (`farnsworth-glm-*`), which shell out to the `glm`/z.ai endpoint — the Task tool cannot target a GLM model directly.
+- **Fallback — Task tool + `glm` CLI.** If workflows are unavailable (disabled on the plan, or the user declines), fan out manually per `references/orchestration.md`: Anthropic attempts via the Task tool, GLM attempts via backgrounded `glm` calls, then run the Opus review yourself.
 
-If many concurrent requests hit provider rate ceilings, run in smaller parallel batches rather than all at once.
+Apply a fresh diversity draw for each round (Phase 1b). The essential rules hold on **either** backend:
+
+- **Identical brief plus one modifier.** Every attempt receives the same task text, differing only by its drawn diversity modifier, so any divergence is attributable to it. No attempt is told it is competing, judged, or which attempt it is.
+- **Isolation.** Each attempt gets its own workspace (e.g. `<run-id>/round-1/candidate-<i>/`). Isolated workspaces prevent the race conditions and clobbered files that parallel writes to one location cause.
+- **No cross-talk.** Attempts must not see each other's output. Independence is the point.
+- **Self-summary.** Each attempt leaves its complete work product in its workspace plus a 2 to 4 sentence note on its approach and tradeoffs.
+
+If many concurrent requests hit provider rate ceilings, run in smaller parallel batches rather than all at once. (Mixed Anthropic+GLM rounds spread load across two providers, which helps.)
 
 ## Phase 3: Blind Opus review
 
@@ -140,7 +151,7 @@ Include brief run metadata: the mode, N, the model per attempt, the diversity mo
 
 | Step | Single pass | Two pass |
 |------|-------------|----------|
-| Trigger | `farnsworth loop:N` (or `:N:1`) | `farnsworth loop:N:2` |
+| Trigger | `@@FL:N` / `farnsworth loop:N` | `@@FL:N:2` / `farnsworth loop:N:2` |
 | Phase 0 | parse task, N, mode | parse task, N, mode |
 | Phase 1 | model gate (mandatory stop) | model gate (mandatory stop) |
 | Phase 1b | diversity injection (default on) | diversity injection (default on) |
@@ -150,7 +161,8 @@ Include brief run metadata: the mode, N, the model per attempt, the diversity mo
 | Phase 5 | — | final pool = N round-2 + 1 saved winner; blind Opus rank |
 | Phase 6 | report | report (+ guidance used, winner's round) |
 
-- Marker: `farnsworth loop:N` (single) / `farnsworth loop:N:2` (two pass), case-insensitive, optional leading colon and spaces. Third segment is the pass count (1 or 2).
+- Trigger: sigil `@@FL:N:M` (preferred — e.g. `@@FL:5`, `@@FL:7:2`, `@@fl:4:2`) or prose `farnsworth loop:N[:2]`. N = attempts/round, M = passes (omit/1 = single, 2 = two). Case-insensitive, optional spaces; text before the marker is the task.
+- Dispatch: prefer the bundled `Workflow` script `workflows/tournament.mjs` (live in `/workflows`); Anthropic attempts native, GLM attempts via the `farnsworth-glm-*` wrapper agents. Fallback: Task tool + `glm` CLI. See `references/orchestration.md`.
 - N is per round, an integer of 2 or more. Confirm volume at N ≥ 8 (single pass) or N ≥ 6 (two pass).
 - Phase 1 model question: five options (Opus, Sonnet, Haiku, GLM→submenu, Mixed); GLM drills down to one of glm-5.2/glm-5.1/glm-5/glm-4.7/glm-4.5-air; Mixed loops per attempt over all eight concrete models; in two pass the assignment applies to both rounds. Anthropic attempts dispatch via the Task tool, GLM attempts via the `glm` CLI (agentic). Reviewer/ranker are always Anthropic Opus.
 - Diversity injection (default on): each attempt draws a distinct framing so siblings do not converge. Pool A approach nudges by default (blind-safe); Pool B objective lenses opt-in. Without replacement, seeded, logged. See `references/diversity-injection.md`.

@@ -1,7 +1,12 @@
 {
   "skill_name": "farnsworth-loop",
-  "note": "Should-trigger / should-not-trigger queries for tuning activation. The marker is 'farnsworth loop:N' (single pass) or 'farnsworth loop:N:2' (two pass), case-insensitive, with an optional leading colon and surrounding spaces. The third segment is the pass count: omitted or 1 = single, 2 = two pass. 'mode' is the expected mode for should_trigger cases. Non-triggers are genuine non-tournaments or other tournament phrasings that belong to the separate best-of-n skill, not this explicitly-named one.",
+  "note": "Should-trigger / should-not-trigger queries for tuning activation. Triggers: the sigil '@@FL:N:M' (preferred) or the prose marker 'farnsworth loop:N[:2]', case-insensitive with optional spaces. N = attempts/round, M/P = passes (omitted or 1 = single, 2 = two pass). 'mode' is the expected mode for should_trigger cases. Non-triggers are genuine non-tournaments or other tournament phrasings that belong to the separate best-of-n skill, not this explicitly-named one.",
   "queries": [
+    {"query": "do abc @@FL:5", "should_trigger": true, "mode": "single"},
+    {"query": "do abc @@FL:5:2", "should_trigger": true, "mode": "two"},
+    {"query": "make a hangman game @@fl:7:2", "should_trigger": true, "mode": "two"},
+    {"query": "refactor this regex @@FL:3:1", "should_trigger": true, "mode": "single"},
+    {"query": "write a haiku @@FL : 4 : 2", "should_trigger": true, "mode": "two"},
     {"query": "do abc :farnsworth loop:5", "should_trigger": true, "mode": "single"},
     {"query": "do abc: farnsworth loop:5:2", "should_trigger": true, "mode": "two"},
     {"query": "write a python program for hangman game, farnsworth loop:4", "should_trigger": true, "mode": "single"},

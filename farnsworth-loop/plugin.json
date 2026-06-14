@@ -1,6 +1,6 @@
 {
   "name": "farnsworth-loop",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Run a Farnsworth Loop tournament in one of two modes. Single pass: produce N independent solutions in parallel, then a blind Opus reviewer scores them, lists pros and cons, ranks them, and names a winner. Two pass: the same first round, but the Opus reviewer also distils what worked and what failed into guidance; the losing attempts are discarded, a second round of N fresh attempts is run with that guidance (positives to emulate, pitfalls to avoid), the saved round one winner is added back, and a final Opus ranker picks the overall winner. First ask the user which model to use for the attempts: Anthropic Opus/Sonnet/Haiku, a GLM z.ai model (glm-5.2/glm-5.1/glm-5/glm-4.7/glm-4.5-air, run via the glm CLI), or Mixed per-attempt; the blind reviewer/ranker is always Anthropic Opus. Trigger on the marker 'farnsworth loop:N' (single pass) or 'farnsworth loop:N:2' (two pass), case-insensitive, with or without a leading colon and surrounding spaces, e.g. 'do abc :farnsworth loop:5' or 'do abc: farnsworth loop:5:2'.",
   "author": {
     "name": "Rob Anderson"
@@ -8,6 +8,13 @@
   "components": {
     "skills": [
       "farnsworth-loop"
+    ],
+    "agents": [
+      "farnsworth-glm-5-2",
+      "farnsworth-glm-5-1",
+      "farnsworth-glm-5",
+      "farnsworth-glm-4-7",
+      "farnsworth-glm-4-5-air"
     ]
   }
 }
