@@ -1,9 +1,10 @@
 #!/usr/bin/env node
-// fl-parse.mjs — Farnsworth Loop Phase-0 parser + normaliser (Feature 2).
+// fl-parse.mjs — Farnsworth Loop Phase-0 parser + normaliser (Feature 2 + Feature 1).
 //
 // Single source of truth for the @@FL sigil / prose-marker grammar, the prose
-// model spec, the strict normaliser, the Top Mixed preset, and the
-// explicit-N-vs-prose conflict rule.
+// model spec, the strict normaliser, the Top Mixed preset, the
+// explicit-N-vs-prose conflict rule, and (NEW, Feature 1) the grand-loop Z
+// parameter.
 //
 // Pure & deterministic: no Date, no random, no I/O except the tiny CLI guard at
 // the bottom. NEVER throws on user input — every failure becomes an errors[]
@@ -13,9 +14,25 @@
 // CLI:   node fl-parse.mjs "<raw user message>"
 // Prints { task, n, mode, z, assignment, preset?, conflict?, errors?, needsGate? }
 //
-// Z is parsed as INERT plumbing only (Feature 1 not implemented): validated
-// (int >= 1), and if Z > 1 a single 'grand loops not yet implemented' error is
-// emitted. Nothing acts on Z here.
+// Feature 1 (grand loops, Z): Z is now a REAL parameter, not inert plumbing.
+//   - Z optional, default 1.  Z=1 == today's behaviour exactly (isolated
+//     tournament, no repo writes, no PR) — byte-identical output for any input
+//     that omits Z or sets Z=1.
+//   - Z>=2 is VALID and flows on to the SKILL's grand-loop authorization +
+//     driver.  No "grand loops not yet implemented" stop any more.
+//   - Z_MAX = 5 is a runaway-SAFETY ceiling (not a cost cap — cost is not a
+//     constraint here).  Z > Z_MAX is a LOUD error that echoes the offending Z
+//     and tells the user to split into batches; n/assignment are nulled so a
+//     caller that ignores errors cannot mistake it for a valid run.
+
+// ---------------------------------------------------------------------------
+// Constants.
+// ---------------------------------------------------------------------------
+// Runaway-safety ceiling on grand loops. Z>Z_MAX is refused outright. This is a
+// safety bound, NOT a cost bound (cost is not a constraint for this user) — but
+// an unattended chain that mutates a real repo Z times per Enter must have a
+// hard cap so a fat-fingered @@FL:5:2:30 cannot run 30 repo-mutating loops.
+const Z_MAX = 5;
 
 // ---------------------------------------------------------------------------
 // Normaliser table (the strict gate). alias -> { model, dispatch }.
@@ -342,17 +359,28 @@ function parse(rawInput) {
   }
   result.mode = mode;
 
-  // --- 5. Z (inert plumbing). ---
+  // --- 5. Z (grand loops, Feature 1 — now a REAL parameter). ---
+  // Default 1 == today's behaviour exactly. Z>=2 is VALID and flows on to the
+  // SKILL's grand-loop authorization + driver (NO "not yet implemented" stop).
+  // Z>Z_MAX is a LOUD error that echoes the offending Z and nulls n/assignment.
   let z = 1;
   if (marker.zSeg.present) {
     if (marker.zSeg.value === null || marker.zSeg.value < 1) {
       errors.push('Invalid Z=' + (marker.zSeg.value === null ? '(empty)' : marker.zSeg.value) +
         '. Z must be an integer >= 1.');
+    } else if (marker.zSeg.value > Z_MAX) {
+      // Runaway safety. Echo the offending Z (NOT silently reset to 1) so a
+      // caller that ignores errors[] cannot mistake it for a valid Z=1 run.
+      z = marker.zSeg.value;
+      errors.push(
+        'Z=' + marker.zSeg.value + ' exceeds the grand-loop ceiling Z_MAX=' + Z_MAX +
+        '. This is a runaway-safety bound (not a cost cap). Split into batches: ' +
+        'run several invocations with Z<=' + Z_MAX + ' instead (e.g. ' +
+        '@@FL:N:M:' + Z_MAX + ' now, then another @@FL:N:M:' + (marker.zSeg.value - Z_MAX) + ' later).'
+      );
     } else {
       z = marker.zSeg.value;
-      if (z > 1) {
-        errors.push('grand loops not yet implemented (Z=' + z + '). Z>1 is inert plumbing; re-run with Z=1.');
-      }
+      // z in [1..Z_MAX] is valid. z>=2 simply flows on; the SKILL gates it.
     }
   }
   result.z = z;
@@ -493,7 +521,9 @@ function parse(rawInput) {
   result.task = stripAll(task, spec, msg, marker).trim();
 
   // --- 11. On any error, null out n/assignment so a careless caller can't run
-  //         the wrong tournament. (mode/z/task/errors stay for the message.) ---
+  //         the wrong tournament. (mode/z/task/errors stay for the message —
+  //         z is deliberately PRESERVED, including an over-ceiling Z, so the
+  //         message can name the offending value.) ---
   if (errors.length) {
     result.errors = errors;
     result.n = null;
@@ -553,6 +583,7 @@ export {
   locateSpec,
   NORMALISER,
   TOP_MIXED_POOL,
+  Z_MAX,
 };
 
 // ---------------------------------------------------------------------------

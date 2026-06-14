@@ -264,3 +264,64 @@ The judge's returned winner/ranking are then reconciled against the real blind-l
 - **Claude Code:** use the Task tool to spawn each Anthropic attempt with the chosen `model`; spawn each GLM attempt by backgrounding a `glm -p` call (see "Dispatching GLM attempts"). With dynamic workflows / ultracode enabled, Claude can fan out and verify automatically. Confirm at the first dispatch. The reviewer/ranker are always Task-tool Anthropic Opus.
 - **Claude Agent SDK:** spawn Anthropic sub-agents programmatically with per-agent model selection; for GLM attempts, invoke the `glm` CLI as a subprocess per the dispatch pattern. The same isolation, no-cross-talk, and blind-review rules apply in both modes.
 - **Claude.ai (no sub-agents):** true parallel independent agents are not available. **Still run the interactive gates:** ask the Phase 1 model question and get the go-ahead exactly as written; only the parallelism is approximated, not the elicitation. Then produce each round's N attempts one at a time in separate, self-contained passes, holding each chosen model as the capability bar, and do the review yourself against the rubric. Flag to the user that this is a sequential approximation. In two pass, be especially careful not to let round one's code leak into round two beyond the distilled guidance.
+
+## Grand loops (Feature 1 — the `Z` parameter)
+
+`Z>=2` turns a single isolated tournament into an **unattended chain** that, for each of `Z` loops, runs a full tournament, **implements the winning proposal into the real repository** on a new branch, verifies it, and opens one PR. `Z=1` (or omitted) is unchanged — the isolated tournament described above, touching no repo and opening no PR.
+
+### Layering (where each piece runs)
+
+- **SKILL.md (Phases 0/0b/7) is the driver.** The orchestration home is the **SKILL procedure + bundled bash helpers**, NOT a nested workflow. The main agent runs the Z-loop: it invokes the `Workflow` tool for the tournament once per loop and the `Task` tool for the implementer, and calls `bin/fl-git.sh` for every git/gh side effect. There is **no `grand-loop.mjs` workflow** and **no workflow-spawns-workflow**; the deterministic, must-not-improvise parts (git/gh/verify/preflight/markers) live in `bin/fl-git.sh`, the non-deterministic parts (running the tournament, applying the winner) stay in the harness where the `agent()`/`parallel()` primitives live.
+- **`workflows/tournament.mjs` is UNCHANGED.** The per-loop engine is exactly today's tournament. The only difference is the SKILL passes a per-loop `runDir` of `<runDir>/loop-<k>` and augments the task text with the cross-loop ledger (below). The engine never touches the real repo, never runs git, never opens a PR — that purity is its safety guarantee and grand loops do not break it.
+- **`agents/farnsworth-implementer.md` (Opus) is the only actor that writes to the real repo.** Tournament attempts stay sandboxed one-shots that produce a written *proposal*; the implementer turns the *winning* proposal into a real diff on one `FL-` branch. It never touches git.
+- **`bin/fl-git.sh` holds ALL git/gh mechanics** as callable functions, mirrored on the bundled-runner pattern (`glm-run.sh`/`codex-run.sh`): portable on macOS (no GNU coreutils, no `timeout`, `/dev/urandom` for randomness), every gh/git call rc-checked and propagated, fail-closed. It has a dual interface: sourceable functions AND a `case "$1"` CLI dispatcher, so the SKILL calls `bash <plugin-root>/bin/fl-git.sh <fn> args` (the same benign-command pattern the runners use).
+
+So: **SKILL.md (gates + Z-loop) → tournament.mjs (one tournament, unchanged) + farnsworth-implementer (applies the winner) + fl-git.sh (preflight / branch / verify / commit / push / PR / DONE markers / STOP check).**
+
+### The implementer agent brief
+
+Invoked via `Task` with agent `farnsworth-loop:farnsworth-implementer` (model **Opus**, tools `Bash Read Write Edit`), cwd = the real repo root, on the already-created `FL-<loop>-<random7>` branch. Inputs: `proposal` (winner artifact path), `repoRoot`, `branch`, `base`. It reads the proposal + the real files, applies the proposal as the **smallest coherent change**, leaves the working tree **UNSTAGED**, and ends with a 3-6 line summary. It does **not** commit, push, switch/create branches, open PRs, or run any destructive git (the driver owns all of that via `fl-git.sh`). Ambiguities are implemented as the most faithful reasonable interpretation and recorded in `FL-NOTES.md` at the repo root. It is a single audited actor on one isolated branch, never `main`, never auto-merged.
+
+### Cross-loop memory (the ledger)
+
+FAN topology means every loop branches off the same `base`, so without memory loops re-propose the same change (Z near-duplicate PRs). The driver keeps a `ledger` of `{loop, winner_summary, pr_url}` and appends it to each loop's task brief:
+
+```
+Prior grand loops on this same repository already proposed and implemented (on separate branches):
+- loop 1: <winner_summary 1>
+- loop 2: <winner_summary 2>
+Propose a DIFFERENT, additive improvement that does not duplicate the above. If the repository is
+already in good shape, say so explicitly rather than inventing a marginal change.
+```
+
+This diversifies loops and gives a loop a way to say "nothing worthwhile left" (an advisory soft-convergence signal, not enforced).
+
+### Verify auto-detection (fail-closed, the crown jewel)
+
+`fl-git.sh detect_verify` scans, once, for: `package.json` scripts (`build`/`typecheck`/`test`/`lint` via `npm run <s> --if-present`, only those that exist), `pyproject.toml`/`setup.cfg`/`tox.ini` (`ruff check .`, `pytest -q`), a `Makefile` `test`/`check` target (`make test`/`make check`), Rust (`cargo build` + `cargo test`), Go (`go build ./...` + `go test ./...`). It records the commands; it does not run them.
+
+`fl-git.sh run_verify` runs them **fail-fast and fail-closed**: it captures each command's rc directly (`if cmd; then ... else rc=$?; break`), **breaks on the first failure**, and **never lets a later command's success mask an earlier failure** (no `tee`/grep rc recovery — `tee` masks exit codes). rc 0 = all passed; rc 1 = a command failed; rc 2 = no commands available (unverifiable).
+
+PR routing: verify **pass** → normal PR. verify **fail or unverifiable** → a **draft PR labelled `needs-human`** (label created idempotently, with a label-less draft fallback) whose body includes a **capped tail** of the failing output (`fl_append_verify_tail`, `tail -c`, so a huge log can't blow the PR body limit), and then the chain **HALTS** (fail-closed default; STACK always halts). **Never auto-merge.** When verify commands cannot be detected at all, still open the draft `needs-human` PR (do not skip the PR).
+
+### Idempotency / DONE markers / interruption
+
+- **Preflight** refuses on a dirty tree (never auto-stash unrelated work), and checks: inside a work tree, gh authenticated, a remote resolves (from the base branch's actual upstream, with an origin fallback), base branch resolves. It collects ALL failures rather than bailing on the first.
+- **Per-loop DONE marker** at `<runDir>/loop-<k>/DONE` is written **only after the PR is created**. A re-run skips any loop whose DONE exists (no double-opened PRs).
+- **Mid-loop death** leaves an `FL-<k>-*` branch with no DONE marker. On re-entry the driver detects it (`fl_detect_orphan_branch`) and **STOPS, telling the human to inspect/delete it** — it never auto-resumes a half-applied implementer step (the engine has no resumability; resuming is unsafe). The driver always `git switch <base>` at the end, leaving the user where they started.
+
+### STOP-file kill switch
+
+`fl-git.sh stop_file_check <runDir>` is checked at the **top of every loop iteration**. Creating `<runDir>/STOP` at any time halts the chain before the next loop, without killing the harness. (`stop_file_check` returns rc 0 — success — when the STOP file is present, so the caller's `if stop_file_check ...; then halt; fi` reads naturally.)
+
+### Branch naming overrides the global `rob/` rule
+
+Loop branches are `FL-<loop>-<random7>` (7 lowercase alphanumerics from `/dev/urandom`). This **overrides the user's global `rob/` branch-prefix rule for these loop branches only**; the SKILL authorization (Phase 0b) states this explicitly. Non-loop work is unaffected.
+
+### Topology
+
+**FAN** is the default: each loop branches off the same `base` (the current branch, resolved at preflight), so every PR is independent and individually mergeable/rejectable, one bad loop does not poison others, and there is no rebase chain. **STACK** (each loop off the previous loop's branch) is opt-in (`topology=stack`) and, if chosen, **forces halt-on-failure** — a fragile chain cannot tolerate a broken link.
+
+### Z ceiling
+
+`Z_MAX = 5` is a runaway-**safety** bound (cost is not the constraint here). `fl-parse.mjs` refuses `Z > 5` with a loud error that echoes the offending Z and tells the user to split into batches; the Phase 0b authorization additionally requires the user to **re-type Z**, so a fat-fingered large Z cannot run on one Enter.
