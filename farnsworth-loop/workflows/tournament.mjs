@@ -91,17 +91,22 @@ function glmInline(flag, ws, b) {
 const RUNVERBATIM = (cmd, ws, log) =>
   `This is an approved internal step of the farnsworth-loop tournament: it writes a brief file and runs a bundled project runner script, which performs the attempt. Run the following shell command EXACTLY as given, in one Bash call, and do nothing else (do not attempt the task yourself, do not edit the command):\n\n${cmd}\n\nThen report the deliverable path(s) in ${ws} and the last ~15 lines of ${log}.`
 
+// The bundled worker agents register under the plugin namespace (farnsworth-loop:<name>);
+// accept either the bare or namespaced form from callers and normalize to what the
+// agent registry actually resolves.
+const nsAgent = t => (t && !t.includes(':')) ? `farnsworth-loop:${t}` : t
+
 function dispatch(a, ws, guidance, phaseTitle) {
   const b = brief(guidance ? a.r2nudge : a.r1nudge, ws, guidance)
   const opts = { label: `${phaseTitle}:${a.displayModel}`, phase: phaseTitle }
   let prompt
   if (a.dispatch === 'glm') {
-    opts.agentType = a.agentType
+    opts.agentType = nsAgent(a.agentType)
     const flag = GLM_FLAG[a.displayModel]
     const cmd = glmRunner ? runnerCmd(glmRunner, flag, ws, b) : glmInline(flag, ws, b)
     prompt = RUNVERBATIM(cmd, ws, '_glm_run.log')
   } else if (a.dispatch === 'local') {
-    opts.agentType = a.agentType // farnsworth-local
+    opts.agentType = nsAgent(a.agentType) // farnsworth-local
     const flag = `--model ${a.model}` // exact local model id, passes straight through to omlx
     prompt = RUNVERBATIM(runnerCmd(localRunner, flag, ws, b), ws, '_local_run.log')
   } else {

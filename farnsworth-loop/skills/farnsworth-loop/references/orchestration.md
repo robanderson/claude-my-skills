@@ -58,13 +58,13 @@ Workflow({ scriptPath: "<plugin-root>/workflows/tournament.mjs", args: <ARGS> })
       displayModel: "haiku",             // for the report; NOT shown to judges
       r1nudge: "<Pool A nudge>", r2nudge: "<fresh Pool A nudge>" },
     { label: "candidate-2",
-      dispatch: "glm",                   // runs via a wrapper agent + the runner script
-      agentType: "farnsworth-glm-5-2",   // one of the bundled GLM worker agents
+      dispatch: "glm",                              // runs via a wrapper agent + the runner script
+      agentType: "farnsworth-loop:farnsworth-glm-5-2",  // namespaced bundled GLM worker agent
       displayModel: "glm-5.2",
       r1nudge: "...", r2nudge: "..." },
     { label: "candidate-3",
-      dispatch: "local",                 // runs via the generic local agent + runner
-      agentType: "farnsworth-local",     // the single bundled local worker agent
+      dispatch: "local",                            // runs via the generic local agent + runner
+      agentType: "farnsworth-loop:farnsworth-local",    // namespaced single local worker agent
       model: "gemma-4-26b-a4b-it-8bit",  // exact omlx model id -> `--model <id>`
       displayModel: "gemma-4-26b-a4b-it-8bit",
       r1nudge: "...", r2nudge: "..." }
@@ -73,15 +73,17 @@ Workflow({ scriptPath: "<plugin-root>/workflows/tournament.mjs", args: <ARGS> })
 }
 ```
 
-**Model → agentType map** for GLM attempts (the wrapper bakes the `glm` flag, see the table above):
+**Model → agentType map** for GLM attempts. Agent types register under the **plugin namespace**, so use the `farnsworth-loop:` prefix (the workflow also auto-prefixes a bare name, but pass the namespaced form):
 
 | GLM model | agentType |
 |-----------|-----------|
-| glm-5.2 | `farnsworth-glm-5-2` |
-| glm-5.1 | `farnsworth-glm-5-1` |
-| glm-5 | `farnsworth-glm-5` |
-| glm-4.7 | `farnsworth-glm-4-7` |
-| glm-4.5-air | `farnsworth-glm-4-5-air` |
+| glm-5.2 | `farnsworth-loop:farnsworth-glm-5-2` |
+| glm-5.1 | `farnsworth-loop:farnsworth-glm-5-1` |
+| glm-5 | `farnsworth-loop:farnsworth-glm-5` |
+| glm-4.7 | `farnsworth-loop:farnsworth-glm-4-7` |
+| glm-4.5-air | `farnsworth-loop:farnsworth-glm-4-5-air` |
+
+(Local attempts use `farnsworth-loop:farnsworth-local` for every model.)
 
 Anthropic attempts pass `dispatch:"anthropic"` + `model`; the workflow spawns them natively. GLM attempts pass `dispatch:"glm"` + `agentType` (per the map above) + `displayModel`. **Local attempts** pass `dispatch:"local"` + `agentType:"farnsworth-local"` + `model` (the exact omlx id, also used as `displayModel`). The workflow blind-labels candidates, the Opus reviewer/ranker **reads and runs each candidate's files** from its workspace (judges never receive model identities), and the script returns `{ round1.mapping, round1.review, guidance?, final.mapping, final.rank, final.winnerRound }` — everything Phase 6 needs to unblind and report.
 
