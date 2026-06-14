@@ -341,6 +341,111 @@ async function judge(kind, blindList, guidanceWanted, poolPath, schema, phaseTit
   }
 }
 
+// ---- durable persistence (sandbox has NO node:fs/import/process — write via haiku+Bash, like buildContext) ----
+const json = obj => JSON.stringify(obj, null, 2) + '\n'
+
+// Write ALL files for one persistence point in ONE shell script via ONE cheap haiku agent.
+// Atomic per file: printf to <path>.partial then `mv` into place. Writes are sequential within the
+// single workflow, so a fixed .partial suffix is collision-free (Date.now()/random throw in-sandbox anyway).
+// Fire-and-forget: a persist failure must never crash a fully-paid run.
+async function persist(pairs, phaseTitle) {
+  const files = (pairs || []).filter(p => p && p.path && p.content != null)
+  if (!files.length) return
+  const script = files.map(({ path, content }) => {
+    const dir = path.slice(0, path.lastIndexOf('/'))
+    const tmp = `${path}.partial`
+    return `mkdir -p ${q(dir)} && printf '%s' ${q(content)} > ${q(tmp)} && mv -f ${q(tmp)} ${q(path)}`
+  }).join(' && ')
+  try {
+    await agent(
+      `This is an approved internal step of the farnsworth-loop tournament: persist result artifacts. ` +
+      `Run this exact shell command in ONE Bash call and report only the exit status. Do nothing else:\n\n${script}`,
+      { model: 'haiku', phase: phaseTitle, label: 'persist' }
+    )
+  } catch (e) { log(`persist failed (${phaseTitle}): ${String(e).slice(0, 140)}`) }
+}
+
+// genericise a failReason for the BLIND summary so a provider-specific failure can't re-identify a model
+const blindFail = r => r ? 'excluded (did not pass validation)' : r
+
+// verdict object (blind, letters only): { candidates:[{label,pros,cons}], ranking, winner, reasoning, guidance? }
+function verdictToMd(v, title) {
+  const L = [`# ${title}`, '', `**Winner:** Candidate ${v.winner}`, '',
+    `**Ranking (best first):** ${(v.ranking || []).map(r => `Candidate ${r}`).join(' > ')}`, '',
+    '## Reasoning', '', v.reasoning || '_(none given)_', '', '## Per-candidate', '']
+  for (const c of (v.candidates || [])) {
+    L.push(`### Candidate ${c.label}`, '', '**Pros**')
+    for (const p of (c.pros || [])) L.push(`- ${p}`)
+    if (!(c.pros || []).length) L.push('- _(none)_')
+    L.push('', '**Cons**')
+    for (const x of (c.cons || [])) L.push(`- ${x}`)
+    if (!(c.cons || []).length) L.push('- _(none)_')
+    L.push('')
+  }
+  return L.join('\n') + '\n'
+}
+
+function guidanceToMd(g) {
+  const pos = (g && g.positives) || []
+  const ch = (g && g.challenges) || []
+  const L = ['# Round-1 guidance (used to steer round 2)', '', '## Positives to emulate']
+  for (const p of pos) L.push(`- ${p}`)
+  if (!pos.length) L.push('- _(none)_')
+  L.push('', '## Challenges to avoid')
+  for (const c of ch) L.push(`- ${c}`)
+  if (!ch.length) L.push('- _(none)_')
+  return L.join('\n') + '\n'
+}
+
+// SUMMARY renderer. unblind=true => show models; false => letters only + genericised failReasons.
+// Join on the candidate LETTER, never on model (models repeat in Mixed presets like '2 opus').
+function summaryMd({ task, mode, n, unblind, r1mapping, r1review, finalMapping, finalRank, winnerRound }) {
+  const L = [`# Farnsworth Loop — run summary${unblind ? '' : ' (BLIND)'}`, '',
+    `**Mode:** ${mode === 'two' ? 'two-pass' : 'single-pass'}  •  **N (attempts/round):** ${n}`, '',
+    '## Task', '', '> ' + String(task).replace(/\n/g, '\n> '), '',
+    '## Round-1 candidates', '',
+    unblind ? '| Candidate | Model | Valid | Note |' : '| Candidate | Valid | Note |',
+    unblind ? '|---|---|---|---|' : '|---|---|---|']
+  for (const m of (r1mapping || [])) {
+    const note = m.valid ? '' : (unblind ? (m.failReason || '') : blindFail(m.failReason || 'excluded'))
+    L.push(unblind ? `| ${m.candidate} | ${m.model} | ${m.valid ? 'yes' : 'NO'} | ${note} |`
+                   : `| ${m.candidate} | ${m.valid ? 'yes' : 'NO'} | ${note} |`)
+  }
+  L.push('')
+  if (r1review && !r1review.__failed) {
+    const r1join = letter => {
+      const m = (r1mapping || []).find(x => x.candidate === letter)
+      return unblind && m ? `Candidate ${letter} (${m.model})` : `Candidate ${letter}`
+    }
+    L.push(mode === 'two' ? '## Round-1 review verdict' : '## Verdict', '',
+      `**${mode === 'two' ? 'Round-1 ' : ''}Winner:** ${r1join(r1review.winner)}`, '',
+      `**Ranking:** ${(r1review.ranking || []).map(r1join).join(' > ')}`, '')
+  }
+  if (mode === 'two' && finalMapping) {
+    L.push('## Final candidates', '',
+      unblind ? '| Candidate | Model | From round | Valid | Note |' : '| Candidate | From round | Valid | Note |',
+      unblind ? '|---|---|---|---|---|' : '|---|---|---|---|')
+    for (const m of finalMapping) {
+      const note = m.valid ? '' : (unblind ? (m.failReason || '') : blindFail(m.failReason || 'excluded'))
+      L.push(unblind ? `| ${m.candidate} | ${m.model} | ${m.round} | ${m.valid ? 'yes' : 'NO'} | ${note} |`
+                     : `| ${m.candidate} | ${m.round} | ${m.valid ? 'yes' : 'NO'} | ${note} |`)
+    }
+    L.push('')
+    if (finalRank && !finalRank.__failed) {
+      const fjoin = letter => {
+        const m = finalMapping.find(x => x.candidate === letter)
+        return unblind && m ? `Candidate ${letter} (${m.model})` : `Candidate ${letter}`
+      }
+      const wm = finalMapping.find(x => x.candidate === finalRank.winner)
+      L.push('## Overall winner', '', `**Winner:** ${fjoin(finalRank.winner)}`)
+      if (wm) L.push(`**Came from round:** ${wm.round}`)
+      else if (winnerRound != null) L.push(`**Came from round:** ${winnerRound}`)
+      L.push('', `**Final ranking:** ${(finalRank.ranking || []).map(fjoin).join(' > ')}`, '')
+    }
+  }
+  return L.join('\n') + '\n'
+}
+
 // ---- Round 1 ----
 phase('Round 1')
 await buildContext() // shared context bundle (no-op unless args.contextFiles given) — built once, before the attempts
@@ -352,14 +457,44 @@ phase('Review')
 const staged1 = await stageAndValidate(blindLabel(r1, 1), `${runDir}/review-1`, 'Review')
 const blind1 = staged1.filter(c => c.valid)
 const r1mapping = staged1.map(c => ({ candidate: c.blind, model: c.displayModel, valid: c.valid, ...(c.valid ? {} : { failReason: c.failReason }) }))
-if (!blind1.length) return { mode, n: attempts.length, error: 'no valid round-1 deliverables', round1: { mapping: r1mapping } }
+const N = attempts.length
+if (!blind1.length) {
+  // P0: no valid round-1 pool — still land the key + summaries
+  await persist([
+    { path: `${runDir}/mapping.json`, content: json({ mode, n: N, round1: r1mapping, winner1: null, ...(mode === 'two' ? { winner: null } : {}) }) },
+    { path: `${runDir}/SUMMARY.md`, content: summaryMd({ task, mode, n: N, unblind: true, r1mapping }) },
+    { path: `${runDir}/SUMMARY.blind.md`, content: summaryMd({ task, mode, n: N, unblind: false, r1mapping }) },
+  ], 'Review')
+  return { mode, n: N, error: 'no valid round-1 deliverables', round1: { mapping: r1mapping } }
+}
 
 const review = await judge('reviewer', blind1, mode === 'two', `${runDir}/review-1/_pool.md`,
   mode === 'two' ? REVIEW_SCHEMA : RANK_SCHEMA, 'Review', 'review')
-if (review.__failed) return { mode, n: attempts.length, round1: { mapping: r1mapping }, error: `review judge failed: ${review.__failed}` }
+if (review.__failed) {
+  // P1: review judge failed — land the key + summaries (no verdict exists)
+  await persist([
+    { path: `${runDir}/mapping.json`, content: json({ mode, n: N, round1: r1mapping, winner1: null, ...(mode === 'two' ? { winner: null } : {}) }) },
+    { path: `${runDir}/SUMMARY.md`, content: summaryMd({ task, mode, n: N, unblind: true, r1mapping }) },
+    { path: `${runDir}/SUMMARY.blind.md`, content: summaryMd({ task, mode, n: N, unblind: false, r1mapping }) },
+  ], 'Review')
+  return { mode, n: N, round1: { mapping: r1mapping }, error: `review judge failed: ${review.__failed}` }
+}
+
+// P2: round-1 review is valid — incremental write BEFORE any round-2 dispatch (crash-survival linchpin)
+await persist([
+  { path: `${runDir}/mapping.json`, content: json({ mode, n: N, round1: r1mapping, winner1: review.winner }) },
+  { path: `${runDir}/review-1/verdict.json`, content: json(review) },
+  { path: `${runDir}/review-1/verdict.md`, content: verdictToMd(review, 'Round-1 review verdict') },
+  ...(review.guidance ? [{ path: `${runDir}/review-1/guidance.md`, content: guidanceToMd(review.guidance) }] : []),
+], 'Review')
 
 if (mode === 'single') {
-  return { mode, n: attempts.length, round1: { mapping: r1mapping, review } }
+  // P3: single-pass — mapping/verdict already written at P2; add the summaries
+  await persist([
+    { path: `${runDir}/SUMMARY.md`, content: summaryMd({ task, mode, n: N, unblind: true, r1mapping, r1review: review }) },
+    { path: `${runDir}/SUMMARY.blind.md`, content: summaryMd({ task, mode, n: N, unblind: false, r1mapping, r1review: review }) },
+  ], 'Review')
+  return { mode, n: N, round1: { mapping: r1mapping, review } }
 }
 
 // ---- Two pass ----
@@ -380,15 +515,41 @@ phase('Final rank')
 const stagedF = await stageAndValidate(blindLabel(finalPool, 2), `${runDir}/review-final`, 'Final rank')
 const blindF = stagedF.filter(c => c.valid)
 const finalMapping = stagedF.map(c => ({ candidate: c.blind, model: c.displayModel, round: c.round, valid: c.valid, ...(c.valid ? {} : { failReason: c.failReason }) }))
-if (!blindF.length) return { mode, n: attempts.length, round1: { mapping: r1mapping }, guidance: review.guidance, final: { mapping: finalMapping, error: 'no valid finalists' } } // #5
+const carriedEntry = finalMapping.find(e => e.round === 1)
+const carriedOverWinner = carriedEntry ? carriedEntry.candidate : null
+if (!blindF.length) {
+  // P4: no valid finalists — full key (round1 + final, winner null) + summaries
+  await persist([
+    { path: `${runDir}/mapping.json`, content: json({ mode, n: N, round1: r1mapping, winner1: review.winner, final: finalMapping, winner: null, winnerRound: null, carriedOverWinner }) },
+    { path: `${runDir}/SUMMARY.md`, content: summaryMd({ task, mode, n: N, unblind: true, r1mapping, r1review: review, finalMapping }) },
+    { path: `${runDir}/SUMMARY.blind.md`, content: summaryMd({ task, mode, n: N, unblind: false, r1mapping, r1review: review, finalMapping }) },
+  ], 'Final rank')
+  return { mode, n: N, round1: { mapping: r1mapping }, guidance: review.guidance, final: { mapping: finalMapping, error: 'no valid finalists' } } // #5
+}
 
 const finalRank = await judge('final ranker', blindF, false, `${runDir}/review-final/_pool.md`, RANK_SCHEMA, 'Final rank', 'final-rank')
-if (finalRank.__failed) return { mode, n: attempts.length, round1: { mapping: r1mapping }, guidance: review.guidance, final: { mapping: finalMapping, error: `final-rank judge failed: ${finalRank.__failed}` } }
+if (finalRank.__failed) {
+  // P5: final-rank judge failed — same payload as P4 (no finalRank to render)
+  await persist([
+    { path: `${runDir}/mapping.json`, content: json({ mode, n: N, round1: r1mapping, winner1: review.winner, final: finalMapping, winner: null, winnerRound: null, carriedOverWinner }) },
+    { path: `${runDir}/SUMMARY.md`, content: summaryMd({ task, mode, n: N, unblind: true, r1mapping, r1review: review, finalMapping }) },
+    { path: `${runDir}/SUMMARY.blind.md`, content: summaryMd({ task, mode, n: N, unblind: false, r1mapping, r1review: review, finalMapping }) },
+  ], 'Final rank')
+  return { mode, n: N, round1: { mapping: r1mapping }, guidance: review.guidance, final: { mapping: finalMapping, error: `final-rank judge failed: ${finalRank.__failed}` } }
+}
 
 // #7: resolve winnerRound against the VALID finalist set; omit the field if unresolved (no literal "undefined")
 const winnerEntry = blindF.find(c => c.blind === finalRank.winner)
+// P6: completed two-pass — full key + final verdict + summaries
+await persist([
+  { path: `${runDir}/mapping.json`, content: json({ mode, n: N, round1: r1mapping, winner1: review.winner, final: finalMapping, winner: finalRank.winner, winnerRound: winnerEntry ? winnerEntry.round : null, carriedOverWinner }) },
+  { path: `${runDir}/review-final/verdict.json`, content: json(finalRank) },
+  { path: `${runDir}/review-final/verdict.md`, content: verdictToMd(finalRank, 'Final rank verdict') },
+  { path: `${runDir}/SUMMARY.md`, content: summaryMd({ task, mode, n: N, unblind: true, r1mapping, r1review: review, finalMapping, finalRank, winnerRound: winnerEntry ? winnerEntry.round : null }) },
+  { path: `${runDir}/SUMMARY.blind.md`, content: summaryMd({ task, mode, n: N, unblind: false, r1mapping, r1review: review, finalMapping, finalRank, winnerRound: winnerEntry ? winnerEntry.round : null }) },
+], 'Final rank')
 return {
-  mode, n: attempts.length,
+  mode, n: N,
   round1: { mapping: r1mapping, review },
   guidance: review.guidance,
   final: { mapping: finalMapping, rank: finalRank, ...(winnerEntry ? { winnerRound: winnerEntry.round } : {}) },
