@@ -1,0 +1,148 @@
+---
+name: best-of-n
+description: "Run a Best of N tournament in one of two modes. First ask the user which model quality to use for the attempts (Opus, Sonnet, Haiku, or Mixed). SINGLE PASS: produce N independent solutions in parallel, then a blind Opus reviewer scores them, lists pros and cons, ranks them, and names a winner. TWO PASS: the same first round, but the Opus reviewer also distils what worked and what failed into guidance; the losing attempts are discarded, a second round of N fresh attempts is run with that guidance (positives to emulate, pitfalls to avoid), the saved round one winner is added back, and a final Opus ranker picks the overall winner. Trigger on a suffix like 'Best of N: 4' (single pass) or a two-pass marker such as 'Two Pass Best of N: 4', '2-pass best of n', or 'Best of N: 4 two pass' (two pass), case-insensitive; also trigger whenever the user describes a generate-and-rank tournament, with or without an intermediate learning round, even without the exact phrase."
+---
+
+# Best of N
+
+Best of N runs several independent attempts at one task and has a blind Opus reviewer pick the best. It has two modes:
+
+- **Single pass** is the base pattern: N independent attempts in parallel, then one blind Opus review that scores them, ranks them, and names the winner. Done.
+- **Two pass** is single pass with a learning step in the middle. Round one runs and is reviewed exactly as in single pass, but the reviewer also distils what worked and what failed into a short guidance brief. The winner is kept, the other artifacts are discarded, and round two runs N brand new attempts that are handed that guidance (but not the prior code), so they explore fresh while steering away from round one's mistakes. The saved round one winner is then added back into the pool, and a final Opus ranker picks the overall winner.
+
+Two pass is therefore the same spine as single pass plus an extra round. Every shared step below (model choice, diversity injection, attempt dispatch, the review rubric, the report) applies to both modes identically; the only difference is that two pass continues past the first review into a guided round and a final rank.
+
+Why two pass discards the losing artifacts but keeps the lessons: re-using the winner's code would just make round two copy it and collapse the diversity that makes Best of N work. Re-using the distilled pros and cons keeps the diversity while raising the floor.
+
+This skill is an orchestration procedure. Sub-agent dispatch depends on the harness (in Claude Code, the Task tool and dynamic workflows; the Claude Agent SDK exposes the same primitive). Follow the phases in order.
+
+## Operating rule: this skill is interactive, stop and ask first
+
+The moment you detect the trigger, your **first response must be only the Phase 1 model-selection question** (after silently parsing the invocation in Phase 0). Do not plan, do not write any attempt, do not pick a model yourself, and do not produce or pre-compose any candidate in the same turn the task arrives. Wait for the user's answer, then proceed. This applies to **both modes**.
+
+This gate is mandatory **even when the environment cannot truly run separate-model sub-agents** (for example on Claude.ai with a single instance). Do not skip it on the grounds that the model choice "won't matter". It matters because the user explicitly asked to choose, the chosen model sets the capability bar each attempt is produced at, and the choice is recorded in the report. Silently producing the attempts without asking is the single most common failure of this skill; do not do it.
+
+## Phase 0: Parse the invocation and detect the mode
+
+The trigger is a task followed by a Best of N suffix. Parse three things:
+
+- **Task.** Everything before the suffix. Treat it verbatim. Every attempt in every round receives the identical task, so the comparison stays fair.
+- **N.** The integer attached to "Best of N": the number of independent attempts **per round**.
+- **Mode.** Single pass or two pass, decided as follows:
+  - A **two-pass marker** anywhere around the Best of N phrase — `two pass`, `2-pass`, `2 pass`, `two-pass` (case-insensitive; e.g. `Two Pass Best of N: 4`, `2-pass best of n: 4`, `Best of N: 5 two pass`) → **two pass**.
+  - `Best of N: 4` with **no** two-pass marker → **single pass**.
+  - No explicit suffix, but the user clearly describes a generate-and-rank tournament: if they describe a learning round (generate, distil lessons, regenerate with guidance, then judge) → two pass; if they describe a one-shot generate-and-rank → single pass. Ask for N and the model if not given, then proceed.
+
+Run single pass silently when that is what was asked; do not nudge the user toward two pass.
+
+**Examples:**
+- Input: `write a python program for hangman game, Best of N: 4` → task = "write a python program for hangman game", N = 4, mode = **single pass** (4 attempts, 1 Opus review).
+- Input: `write a python program for hangman game, Two Pass Best of N: 4` → same task, N = 4, mode = **two pass** (4 attempts in round one, 4 in round two, plus 1 carried-over winner = 9 candidates touched).
+
+Validate N before continuing:
+- N must be an integer of 2 or more.
+- Single pass is roughly N attempts plus one Opus pass. At N of 8 or more, confirm the user wants that volume.
+- Two pass roughly doubles the attempt count, so its cost ceiling is lower: at N of 6 or more, confirm the user wants that volume before proceeding (see the cost note in Phase 2).
+
+## Phase 1: Choose the models (mandatory gate, stop here — both modes)
+
+This is the gate from the operating rule. Ask it as your first response to the trigger and **wait for the answer before doing anything else**. Ask exactly this, as a four option selection, then stop:
+
+> Which quality of sub-agent do you want for the attempts?
+> 1. Opus (highest capability)
+> 2. Sonnet (balanced)
+> 3. Haiku (fastest, cheapest)
+> 4. Mixed (choose a model per attempt)
+
+Handle the answer:
+
+- **Options 1, 2, or 3 (uniform):** every attempt uses that single model. Record the assignment, e.g. for N = 4 with Sonnet: `[sonnet, sonnet, sonnet, sonnet]`.
+- **Option 4 (Mixed):** walk through the attempts one at a time, attempt 1 to attempt N, asking the same question but offering only the three concrete models (Opus, Sonnet, Haiku), not Mixed again. Record each choice, e.g. `[opus, sonnet, sonnet, haiku]`.
+
+In two pass, the model assignment applies to **both rounds**: round two re-uses the same per-attempt list. If the user explicitly wants different models for round two, ask the four-option question again for round two; otherwise re-use round one's assignment. Model aliases and full identifiers are in `references/orchestration.md`. The reviewer and the final ranker are **always Opus**, regardless of what the attempts use.
+
+## Phase 1b: Diversity injection (default on — both modes)
+
+Independent attempts are only valuable if they actually differ. Model heterogeneity and sampling give some of that, but same-model siblings on an identical prompt tend to converge. To prevent that, give each attempt a distinct framing drawn from a modifier pool, following `references/diversity-injection.md`. In short:
+
+- **Pool A (approach nudges), on by default.** These vary how an attempt starts and proceeds, not what counts as a good answer, so the review stays blind. Drawn without replacement within a round so no two attempts share one, biased so same-model siblings get the most different nudges.
+- **Pool B (objective lenses like safely, quickly, efficiently), opt-in only.** These bias the tradeoff an attempt makes. Offer them when the user wants to fan attempts across a tradeoff frontier on purpose, and read the Pool B handling notes before using them (they interact with blind review).
+
+Seed and log the draw so the run is reproducible and the report can show what was applied. If the user prefers fully identical briefs, they can turn diversity injection off.
+
+## Phase 2: Confirm, then run the first round (both modes)
+
+Before spending tokens, show the plan and get a go-ahead:
+
+- The task, quoted exactly.
+- N, the model per attempt, and **which mode** this is (single pass: one round then a final review; two pass: round one, then a guided round two, then a final rank).
+- A cost note scaled to the mode:
+  - **Single pass:** roughly N independent attempts plus one Opus review.
+  - **Two pass:** roughly 2N independent attempts plus two Opus passes (the round one review and the final rank), so token use is about double single pass. Recommend a small N on the first run to gauge usage.
+
+On confirmation, fan out **N sub-agents in parallel** for the first round, following `references/orchestration.md`. Apply a fresh diversity draw for this round (Phase 1b). The essential rules:
+
+- **Identical brief plus one modifier.** Every sub-agent receives the same task text, differing only by its drawn diversity modifier, so any divergence is attributable to it. No agent is told it is competing, judged, or which attempt it is.
+- **Isolation.** Each sub-agent gets its own workspace (for example `best-of-n/<run-id>/round-1/candidate-<i>/`). Isolated workspaces and atomic per-candidate outputs prevent the race conditions and clobbered files that parallel writes to one location cause.
+- **No cross-talk.** Sub-agents must not see each other's output. Independence is the point.
+- **Self-summary.** Each sub-agent returns its complete work product plus a 2 to 4 sentence note on its approach and tradeoffs.
+
+If many concurrent requests hit provider rate ceilings, run in smaller parallel batches rather than all at once.
+
+## Phase 3: Blind Opus review
+
+Spin up one **review agent on Opus**. Hand it every first-round work product, labelled Candidate A, B, C, and so on, **without revealing which model produced which**. Following `references/review-rubric.md`, it scores each candidate, lists concrete pros and cons, ranks them, and names the winner with reasoning.
+
+**Then the modes diverge:**
+
+- **Single pass:** Phase 3's named winner **is the result**. Skip Phases 4 and 5 and go straight to Phase 6 to report. (You do not need the round-two guidance lists; the reviewer can omit them in single-pass mode.)
+- **Two pass:** the reviewer does the **second job** as well — distil guidance for round two. Across all candidates (not just the winner), produce two short lists phrased generically, with no candidate-specific code:
+  - **Positives to consider:** patterns and choices that worked well anywhere in round one.
+  - **Challenges to avoid:** pitfalls, bugs, and weaknesses seen anywhere in round one.
+
+  Then **save** the round one winner's work product (the carried-over champion for the final pool) and **discard** the other round one artifacts, keeping only the distilled guidance — not the losing code. Continue to Phase 4.
+
+## Phase 4 (two pass only): Run round 2 with the guidance
+
+Fan out **N fresh sub-agents in parallel** (same isolation and no-cross-talk rules, new workspaces, for example `.../round-2/candidate-<i>/`). Apply a **fresh Pool A draw** for round two (Pool A only, per `references/diversity-injection.md`: the guidance already carries the objective steering, so Pool B lenses would conflict with it). Each gets the identical task **plus** the distilled guidance, framed like this:
+
+> In producing your answer, please consider these items as possible positives: a, b, c, d (the round one positives). And treat these items as challenges to avoid: w, x, y, z (the round one challenges).
+
+Do **not** give round two agents any prior code or the winner's artifact. They get the task and the guidance only, so they produce genuinely new solutions that are merely steered, not seeded. As before, no agent is told it is competing or judged, and each returns its work product plus a short self-summary.
+
+## Phase 5 (two pass only): Final ranking
+
+Build the final pool: the **N fresh round two attempts plus the saved round one winner** (N + 1 candidates). Re-label the whole pool blind (Candidate A, B, C, ...) in a fixed order, keep a private mapping for the report, and spin up one **Opus ranker**. It scores every candidate against the same rubric (`references/review-rubric.md`), lists pros and cons for each, ranks them, and names the overall winner. The carried-over champion competes blind on the merits like everything else: it produced no worse work for not having seen the guidance, and if a guided round two attempt is genuinely better, it should win.
+
+## Phase 6: Report back (both modes)
+
+Present to the user:
+
+1. **The mapping**, unblinded: which model produced each final candidate. In two pass, also mark which one was the round one carried-over winner.
+2. **(Two pass only) the round two guidance that was used** (the positives-to-consider and challenges-to-avoid lists), so the user can see what steered the second round.
+3. **Per-candidate pros and cons** from the reviewer (single pass) or final ranker (two pass), plus the **ranking and overall winner** with reasoning.
+4. **The winning work product itself** (or offer to save it). Offer a merged "best of all" synthesis only if the user asks; the honest comparison is the primary result.
+
+Include brief run metadata: the mode, N, the model per attempt, the diversity modifier each attempt drew (and the seed), and — in two pass — whether the final winner came from round one or round two, plus wall-clock or token figures if the harness surfaced them.
+
+## Quick reference
+
+| Step | Single pass | Two pass |
+|------|-------------|----------|
+| Trigger | `Best of N: N` (no two-pass marker) | `Best of N: N` plus a two-pass marker |
+| Phase 0 | parse task, N, mode | parse task, N, mode |
+| Phase 1 | model gate (mandatory stop) | model gate (mandatory stop) |
+| Phase 1b | diversity injection (default on) | diversity injection (default on) |
+| Phase 2 | confirm + run N attempts | confirm + run N attempts |
+| Phase 3 | blind Opus review → rank → winner = result | blind Opus review → rank + distil guidance; save winner, discard rest |
+| Phase 4 | — | N fresh attempts given task + guidance, no prior code |
+| Phase 5 | — | final pool = N round-2 + 1 saved winner; blind Opus rank |
+| Phase 6 | report | report (+ guidance used, winner's round) |
+
+- N is per round, an integer of 2 or more. Confirm volume at N ≥ 8 (single pass) or N ≥ 6 (two pass).
+- Phase 1 model question: four options; Mixed loops per attempt; in two pass the assignment applies to both rounds.
+- Diversity injection (default on): each attempt draws a distinct framing so siblings do not converge. Pool A approach nudges by default (blind-safe); Pool B objective lenses opt-in. Without replacement, seeded, logged. See `references/diversity-injection.md`.
+- Round attempts: N parallel, isolated, identical brief plus one diversity modifier, no cross-talk.
+- Review/rank (Opus, blind): pros and cons per candidate, rank, name winner. In two pass also distil positives-to-consider and challenges-to-avoid, save the winner, discard the other artifacts.
+- Dispatch mechanics and the round two brief template: `references/orchestration.md`.
+- Scoring and distillation rubric: `references/review-rubric.md`.

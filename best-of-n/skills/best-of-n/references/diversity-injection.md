@@ -75,7 +75,13 @@ In this attempt, lean toward solving the task <lens> (for example: defensively).
 
 Keep the rest of the brief identical to every other attempt. The modifier is the only thing that differs, so any divergence is attributable to it.
 
-## Two-pass specifics
+## Mode specifics
+
+### Single pass
+
+One round only: take a fresh draw, Pool A on by default, Pool B if the user opted in. Same rules as round one below. There is no second round, so nothing further applies.
+
+### Two pass
 
 - **Round one:** fresh draw, Pool A on by default, Pool B if the user opted in. Maximises exploration before any guidance exists.
 - **Round two:** the distilled guidance already steers every attempt toward similar objectives, which risks convergence, so a **fresh Pool A draw** is valuable to keep paths apart. Do **not** add Pool B lenses in round two: the guidance carries the objective steering, and a conflicting lens ("quickly" against guidance that says "handle every edge case") sends mixed signals. Log the round two draw separately from round one.

@@ -18,9 +18,9 @@
       "source": "./mockoon-cli"
     },
     {
-      "name": "two-pass-best-of-n",
-      "description": "Run a two-pass Best of N tournament: round one produces N parallel solutions judged by an Opus reviewer who distills lessons, round two runs N fresh guided attempts, then a final Opus ranker picks the winner",
-      "source": "./two-pass-best-of-n"
+      "name": "best-of-n",
+      "description": "Run a Best of N tournament. Single pass: N parallel solutions judged blind by an Opus reviewer who ranks them and picks a winner. Two pass: the reviewer also distills lessons, a second round of N guided attempts runs, and a final Opus ranker picks the winner from the new attempts plus the carried-over round-one winner",
+      "source": "./best-of-n"
     }
   ]
 }

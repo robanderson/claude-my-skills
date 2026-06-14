@@ -1,0 +1,13 @@
+{
+  "name": "best-of-n",
+  "version": "2.0.0",
+  "description": "Run a Best of N tournament in one of two modes. Single pass: produce N independent solutions in parallel, then a blind Opus reviewer scores them, lists pros and cons, ranks them, and names a winner. Two pass: the same first round, but the Opus reviewer also distils what worked and what failed into guidance; the losing attempts are discarded, a second round of N fresh attempts is run with that guidance (positives to emulate, pitfalls to avoid), the saved round one winner is added back, and a final Opus ranker picks the overall winner. First ask the user which model quality to use for the attempts (Opus, Sonnet, Haiku, or Mixed). Trigger on a suffix like 'Best of N: 4' (single pass) or 'Two Pass Best of N: 4' / '2-pass best of n' / 'Best of N: 4 two pass' (two pass), and also whenever the user describes a generate-and-rank tournament, with or without a learning round, even without the exact phrase.",
+  "author": {
+    "name": "Rob Anderson"
+  },
+  "components": {
+    "skills": [
+      "best-of-n"
+    ]
+  }
+}
