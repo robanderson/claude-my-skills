@@ -49,7 +49,8 @@ Workflow({ scriptPath: "<plugin-root>/workflows/tournament.mjs", args: <ARGS> })
   runDir: "<absolute run dir>",          // e.g. <plugin>/.runs/<run-id>
   glmRunner: "<plugin-root>/bin/glm-run.sh",      // REQUIRED if any attempt is GLM
   localRunner: "<plugin-root>/bin/local-run.sh",  // REQUIRED if any attempt is Local
-  attemptMaxTurns: 8,                    // optional cap on agentic iterations (GLM/local); default 8
+  attemptMaxTurns: 8,                    // optional iteration cap for GLM attempts; default 8
+  localMaxTurns: 4,                      // optional iteration cap for LOCAL attempts; default 4 (tighter)
   attemptTimeoutSecs: 300,               // optional wall-clock backstop (GLM/local); default 300
   attempts: [                            // one per attempt, length N
     { label: "candidate-1",
@@ -99,7 +100,7 @@ Anthropic attempts pass `dispatch:"anthropic"` + `model`; the workflow spawns th
 
 **Per-attempt guards (two layers).** Both runner scripts bound the nested `claude` call:
 
-1. **`--max-turns` (primary, iteration-based).** Passed from `FL_MAX_TURNS` (workflow `attemptMaxTurns`, default 8). This caps the number of agentic turns, so an attempt that tries to grind the write→run→fix loop (the thing that balloons context to tens of thousands of tokens on local models) is stopped cleanly. Crucially, **the deliverable written before the cap is preserved** — hitting the cap truncates the grind but keeps the best-so-far file (claude prints `Error: Reached max turns (N)` and exits non-zero; the saved file is still graded). 8 is comfortably above a clean single-pass (write + one run + summary ≈ 3-4 turns); lower it (e.g. 4-6) to be stricter, raise it for genuinely multi-step tasks.
+1. **`--max-turns` (primary, iteration-based).** Passed from `FL_MAX_TURNS`: **GLM = `attemptMaxTurns` (default 8); local = `localMaxTurns` (default 4, tighter).** This caps agentic turns, so an attempt that tries to grind the write→run→fix loop is stopped cleanly. Crucially, **the deliverable written before the cap is preserved** — hitting the cap truncates the grind but keeps the best-so-far file (claude prints `Error: Reached max turns (N)` and exits non-zero; the saved file is still graded). Local gets the tighter cap because weaker local models (observed clearly on Qwen) ignore "single pass" and burn turns **rewriting the art on self-critique** ("that's a cow face… proportions are off… let me realign") and **fixing their own buggy code** (bad raw-string escaping; Linux-only `cat -A` on macOS). The hard-stop brief (below) curbs the behaviour at the source; the tight cap is the backstop. A clean single pass under the hard-stop brief is ~2 turns (Write → stop), so 4 is ample.
 2. **Wall-clock timeout (backstop, time-based).** Portable perl `alarm` → TERM/KILL (macOS has no `timeout`/`gtimeout`), from `FL_TIMEOUT_SECS` (workflow `attemptTimeoutSecs`, default 300s). Catches a *single* hung or pathologically slow turn that `--max-turns` can't (one turn never returning). On fire it logs `FARNSWORTH-{GLM,LOCAL}-TIMEOUT secs=N` and exits 124. Scale to task complexity (~180s small, 300s+ heavier).
 
 Either way a bounded-out attempt is just an honest failure and the round proceeds over the survivors. These cover the runner-based (GLM/local) attempts — native Anthropic attempts have no shell hook, but they are fast and bounded by the single-pass brief. The **single-pass brief is the real fix**; these two are the safety net.
@@ -151,8 +152,7 @@ Task:
 
 Rules:
 - Fully specified — do NOT ask questions; make reasonable defaults and just produce your solution.
-- SINGLE pass: write it once and stop. Do NOT iterate to perfect it or loop re-running and fixing.
-  A clear, reasonable, possibly-imperfect solution is what is wanted. Run it at most ONCE as a sanity check.
+- SINGLE pass, then STOP: write the file ONCE and stop. Do NOT run, test, inspect, rewrite, or polish it — your first version is final, even if imperfect.
 - Save your solution file(s) to: farnsworth-loop/<run-id>/round-1/candidate-<i>/  (an empty workspace is a failure;
   the file need NOT be flawless). Work only in that directory.
 - End with a 2 to 4 sentence note on your approach, tradeoffs, and any known limitations.
@@ -176,14 +176,15 @@ And treat these items as challenges to avoid:
 
 Rules:
 - Fully specified — do NOT ask questions; make reasonable defaults and just produce your solution.
-- SINGLE pass: write it once and stop. Do NOT iterate to perfect it or loop re-running and fixing.
-  Run it at most ONCE as a sanity check.
+- SINGLE pass, then STOP: write the file ONCE and stop. Do NOT run, test, inspect, rewrite, or polish it — your first version is final, even if imperfect.
 - Save your solution file(s) to: farnsworth-loop/<run-id>/round-2/candidate-<i>/  (an empty workspace is a failure;
   the file need NOT be flawless). Work only in that directory.
 - End with a 2 to 4 sentence note on your approach, tradeoffs, and any known limitations.
 ```
 
 In neither round, and in either mode, tell an agent it is one of several, what N is, that it will be judged, or hand it another agent's output. Each attempt must be an independent solution. The round two guidance steers; it must not include or paraphrase a specific candidate's code, only generic patterns to emulate and pitfalls to avoid.
+
+**Fresh workspaces + the read-before-write guard.** Each attempt gets its own clean workspace (only `_brief.txt` pre-exists), so the deliverable is a *new* file and Claude Code's "file must be read before overwriting" guard does not fire — verified. It can only fire if a workspace is reused (same run-id across runs, or a resume) and a stale deliverable lingers; weaker local models then waste turns (read → retry) on it. Two cheap defenses: use a **unique run-id per run** so paths never collide, and the brief already instructs attempts to overwrite via the shell (`cat > FILE <<'EOF'`) if a file-edit tool demands a read-first — so even a reused workspace stays a clean single pass.
 
 ### Two dispatch paths (Anthropic vs GLM)
 

@@ -7,7 +7,7 @@ set -uo pipefail
 FLAG="${*:---model gemma-4-26b-a4b-it-8bit}"
 LOG=_local_run.log
 TIMEOUT="${FL_TIMEOUT_SECS:-300}"   # wall-clock backstop (seconds)
-MAXTURNS="${FL_MAX_TURNS:-8}"       # primary guard: cap agentic iterations (single-pass)
+MAXTURNS="${FL_MAX_TURNS:-4}"       # tight cap: local models tend to ignore "single pass" and loop
 
 # Resolve the local server token: prefer the env var; fall back to the user's ~/.zshrc
 # export (the token is the user's own, for their own on-device server — it stays local).

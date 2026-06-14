@@ -47,10 +47,11 @@ ${nudge}
 
 Rules:
 - This task is fully specified and self-contained. Do NOT ask clarifying questions, present options, or stop for input — make reasonable default choices and just produce your solution.
-- Work in a SINGLE pass: write your solution once and stop. Do NOT iterate repeatedly to perfect it, and do NOT keep re-running and fixing. A clear, reasonable solution that may be imperfect is exactly what is wanted; exhaustive polishing is not, and wastes effort. At most, run it ONCE as a quick sanity check — then submit whatever you have.
+- Work in a SINGLE pass and then STOP: write your solution file ONCE, then stop immediately. Do NOT run it, do NOT test or inspect it, and do NOT rewrite, re-align, "improve", or polish it. Your first version is final — even if it is imperfect or not to your taste. Perfecting it is explicitly NOT wanted here and only wastes effort.
 - Your text reply is discarded; ONLY the file(s) you save are kept. You MUST save your solution to a file (an empty workspace is a total failure) — but it does NOT need to be flawless or fully working.
 - Save all deliverable files to: ${ws}
 - Work only in that directory. Create it if needed.
+- To save a file, just write it. If a file-edit tool refuses because the file "must be read first" (a stale copy exists), do NOT spend turns reading/retrying — overwrite it directly with the shell instead, e.g. \`cat > FILE <<'EOF' ... EOF\`.
 - End with a 2 to 4 sentence note on your approach, plus any tradeoffs or known limitations (an honest note about what is rough or unfinished is useful, not a mark against you).`
 }
 
@@ -74,10 +75,13 @@ const localRunner = A.localRunner
 //  - max-turns: PRIMARY guard — caps agentic iterations so single-pass attempts can't
 //    grind the write->run->fix loop (which balloons context, esp. on local models).
 //  - timeout: wall-clock backstop for a single hung/slow turn.
-const attemptMaxTurns = Number(A.attemptMaxTurns) > 0 ? Math.floor(Number(A.attemptMaxTurns)) : 8
+// GLM gets a roomier cap; local models run a tighter cap because they tend to ignore
+// "single pass" and burn turns on a verify-and-polish loop (observed on Qwen).
+const glmMaxTurns = Number(A.attemptMaxTurns) > 0 ? Math.floor(Number(A.attemptMaxTurns)) : 8
+const localMaxTurns = Number(A.localMaxTurns) > 0 ? Math.floor(Number(A.localMaxTurns)) : 4
 const attemptTimeout = Number(A.attemptTimeoutSecs) > 0 ? Math.floor(Number(A.attemptTimeoutSecs)) : 300
 const cmdHead = (ws, b) => `mkdir -p ${q(ws)} && cd ${q(ws)} && printf '%s' ${q(b)} > _brief.txt`
-const runnerCmd = (runner, flag, ws, b) => `${cmdHead(ws, b)} && FL_MAX_TURNS=${attemptMaxTurns} FL_TIMEOUT_SECS=${attemptTimeout} bash ${q(runner)} ${flag}`
+const runnerCmd = (runner, flag, ws, b, maxTurns) => `${cmdHead(ws, b)} && FL_MAX_TURNS=${maxTurns} FL_TIMEOUT_SECS=${attemptTimeout} bash ${q(runner)} ${flag}`
 
 function glmInline(flag, ws, b) {
   return `${cmdHead(ws, b)} && ` +
@@ -103,12 +107,12 @@ function dispatch(a, ws, guidance, phaseTitle) {
   if (a.dispatch === 'glm') {
     opts.agentType = nsAgent(a.agentType)
     const flag = GLM_FLAG[a.displayModel]
-    const cmd = glmRunner ? runnerCmd(glmRunner, flag, ws, b) : glmInline(flag, ws, b)
+    const cmd = glmRunner ? runnerCmd(glmRunner, flag, ws, b, glmMaxTurns) : glmInline(flag, ws, b)
     prompt = RUNVERBATIM(cmd, ws, '_glm_run.log')
   } else if (a.dispatch === 'local') {
     opts.agentType = nsAgent(a.agentType) // farnsworth-local
     const flag = `--model ${a.model}` // exact local model id, passes straight through to omlx
-    prompt = RUNVERBATIM(runnerCmd(localRunner, flag, ws, b), ws, '_local_run.log')
+    prompt = RUNVERBATIM(runnerCmd(localRunner, flag, ws, b, localMaxTurns), ws, '_local_run.log')
   } else {
     opts.model = a.model
     prompt = b
