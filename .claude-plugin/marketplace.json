@@ -16,6 +16,11 @@
       "name": "mockoon-cli",
       "description": "Use Mockoon CLI to create API proxies with full request/response logging, mock API servers for testing, and record real API interactions for debugging",
       "source": "./mockoon-cli"
+    },
+    {
+      "name": "two-pass-best-of-n",
+      "description": "Run a two-pass Best of N tournament: round one produces N parallel solutions judged by an Opus reviewer who distills lessons, round two runs N fresh guided attempts, then a final Opus ranker picks the winner",
+      "source": "./two-pass-best-of-n"
     }
   ]
 }

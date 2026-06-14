@@ -1,0 +1,27 @@
+{
+  "skill_name": "two-pass-best-of-n",
+  "note": "Should-trigger / should-not-trigger queries for tuning activation. The hard edge cases are distinguishing two-pass from single-pass Best of N: a plain 'Best of N: 4' should NOT trigger this skill (it belongs to best-of-n), while a two-pass marker should.",
+  "queries": [
+    {"query": "write a python program for hangman game, Two Pass Best of N: 4", "should_trigger": true},
+    {"query": "build a CSV parser, 2-pass best of n: 3", "should_trigger": true},
+    {"query": "refactor this function, Best of N: 5 two pass", "should_trigger": true},
+    {"query": "draft a distributor pitch email, two pass best of n: 4", "should_trigger": true},
+    {"query": "Two Pass Best of N: 6 - implement a token bucket rate limiter", "should_trigger": true},
+    {"query": "do an iterative best-of-n: run 4, learn from them, run 4 more with the lessons, then pick the best", "should_trigger": true},
+    {"query": "run best of n, take the pros and cons, feed them into a second round, then final rank", "should_trigger": true},
+    {"query": "generate 4 solutions, distil what worked, regenerate with that guidance, then judge all of them", "should_trigger": true},
+    {"query": "two-round best of n on this regex, 5 each round", "should_trigger": true},
+    {"query": "best of n but with a refinement pass: 4 attempts, learn, 4 fresh attempts, final pick", "should_trigger": true},
+    {"query": "write a python program for hangman game, Best of N: 4", "should_trigger": false},
+    {"query": "run a single pass best of n on this, 5 tries", "should_trigger": false},
+    {"query": "generate 4 versions and just rank them, no second round", "should_trigger": false},
+    {"query": "what is iterative refinement in LLM sampling?", "should_trigger": false},
+    {"query": "explain how genetic algorithms do selection and mutation", "should_trigger": false},
+    {"query": "review this code and give me two passes of feedback", "should_trigger": false},
+    {"query": "i made two attempts at this already, which is better?", "should_trigger": false},
+    {"query": "summarise this document in two passes, skim then detail", "should_trigger": false},
+    {"query": "set up a two-stage build pipeline in CI", "should_trigger": false},
+    {"query": "compare Opus and Sonnet on a coding task", "should_trigger": false},
+    {"query": "give me one strong solution, no tournament", "should_trigger": false}
+  ]
+}
