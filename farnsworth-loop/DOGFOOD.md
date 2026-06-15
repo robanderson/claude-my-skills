@@ -16,6 +16,7 @@ Append new items; never renumber.
 
 | id     | sev  | area    | status | title                                                                            | evidence                 |
 |--------|------|---------|--------|----------------------------------------------------------------------------------|--------------------------|
+| D-0005 | sev2 | infra   | done   | fl-bench scores a *completed* claude-family call as FAIL on nonzero exit (haiku, glm-5.1) | docs/dogfood/D-0005.md |
 | D-0001 | sev1 | review  | done   | Blind Opus judge assumes `node:fs` exists; ranks fs-plans over correct haiku+Bash | docs/dogfood/D-0001.md   |
 | D-0004 | sev1 | review  | done   | Non-Anthropic round-1 winner excluded from final pool (carryover provenance re-check) | docs/dogfood/D-0004.md |
 | D-0002 | sev2 | infra   | done   | Round-1 `verdict`/`guidance` silently not written on large two-pass runs         | docs/dogfood/D-0002.md   |

@@ -54,24 +54,105 @@ const RESULTS_DIR = resolve(PLUGIN_ROOT, '.bench')
 const RESULTS_FILE = resolve(RESULTS_DIR, 'results.jsonl')
 
 // ----------------------------------------------------------------------------
-// Fixed, IDENTICAL benchmark prompt + bounded generation for EVERY model, so
-// tok/s is comparable and the run stays fast/cheap. ~256 output tokens target.
+// Benchmark PROFILES. A profile is a fixed, IDENTICAL prompt + output cap +
+// timeouts applied to EVERY model, so tok/s is comparable WITHIN a profile.
+// The profile name is stored on every result row so light/heavy histories never
+// get mixed.
+//
+//   light (default) — a tiny ~200-word paragraph: a fast/cheap smoke of raw
+//        throughput. Output cap is 2048, NOT a few hundred: an extended-thinking
+//        model rejects a sub-1024 cap with `400 thinking.enabled.budget_tokens:
+//        Input should be greater than or equal to 1024`. The old 256 cap is
+//        exactly why haiku FAILED in the all-models sweep (dogfood D-0005); the
+//        ~200-word prompt still keeps the actual decode small, the cap is only a
+//        ceiling that must clear the thinking-budget floor.
+//
+//   heavy — a representative coding/agentic workload: a large fixed input
+//        context (>5k input tokens) plus an instruction that elicits a long
+//        structured deliverable (targets >5k decode tokens). Output cap 8192,
+//        longer timeouts. The light profile's few-hundred-token decode is not
+//        enough to characterise throughput on real coding-sized inputs/outputs.
 // ----------------------------------------------------------------------------
-const MAX_OUTPUT_TOKENS = 256
-const PROMPT =
+const LIGHT_PROMPT =
   'Write exactly one paragraph (about 200 words, no lists, no headings, no code) ' +
   'explaining what a hash map is and why its average-case lookup is O(1). ' +
   'Stop after the single paragraph. Do not ask any questions; do not add anything else.'
 
-// Per-call wall-clock backstop (seconds). Generous enough for a slow cold local
-// model load, short enough that a hung call does not stall the whole sweep.
-const DEFAULT_TIMEOUT_SECS = 240
-const LOCAL_TIMEOUT_SECS = 600   // a cold MLX weight-load can be slow
+// Deterministic, self-contained ~7k-token "codebase" used as the heavy-profile
+// input context so every model receives byte-identical >5k-token input.
+function buildHeavyContext() {
+  const ops = [
+    'get', 'set', 'delete', 'has', 'merge', 'scan', 'expire', 'touch', 'incr', 'decr',
+    'flush', 'keys', 'values', 'entries', 'size', 'clear', 'rename', 'copy', 'dump', 'load',
+    'lock', 'unlock', 'watch', 'unwatch', 'append', 'prepend', 'trim', 'slice', 'index', 'compact',
+  ]
+  const header =
+`/* ============================================================================
+ * Module under review: kvstore.js — an in-memory key/value store with TTL
+ * expiry, counters, range scans, optimistic locking, and change watches.
+ * (Synthetic, self-contained input context for the heavy benchmark profile;
+ *  intentionally sized so the prompt exceeds 5,000 input tokens.)
+ * ========================================================================== */
+function currentTime() { return Date.now() }
+`
+  const blocks = ops.map((op, i) =>
+`// --- ${op}Handler -------------------------------------------------------------
+// Handles the "${op}" operation against the backing map. Validates the key,
+// reconciles the TTL index, updates metrics, and notifies any registered watch
+// callbacks. Known edge cases to consider during review: an empty or null key;
+// an entry that expired exactly at \`now\`; concurrent modification while a scan
+// is iterating; counter overflow past Number.MAX_SAFE_INTEGER; a watch callback
+// that throws and must not abort the operation; and re-entrancy when ${op}
+// triggers another ${ops[(i + 1) % ops.length]} on the same store.
+function ${op}Handler(store, key, value, opts = {}) {
+  if (key == null || key === '') throw new Error('${op}: key required')
+  const now = opts.now != null ? opts.now : currentTime()
+  const entry = store.map.get(key)
+  if (entry && entry.expiresAt && entry.expiresAt <= now) {
+    store.map.delete(key); store.metrics.expired = (store.metrics.expired || 0) + 1
+  }
+  const before = store.map.size
+  const result = compute_${op}(store, key, value, now, opts)   // operation-specific body
+  if (store.map.size !== before) store.dirty = true
+  store.metrics.${op} = (store.metrics.${op} || 0) + 1
+  for (const w of store.watches.get(key) || []) {
+    try { w({ op: '${op}', key, value, now }) } catch (e) { store.metrics.watchErrors++ }
+  }
+  return result
+}`)
+  return header + '\n' + blocks.join('\n\n') + '\n'
+}
+
+const HEAVY_PROMPT =
+  buildHeavyContext() + '\n\n' +
+  'You are a senior engineer reviewing the module above. Produce an EXHAUSTIVE ' +
+  'response containing ALL of the following IN FULL — do not truncate, abbreviate, ' +
+  'summarise, or defer with "...":\n' +
+  '1. A function-by-function code review: for EVERY handler, name a likely bug or ' +
+  'edge case, give its time and space complexity, and propose one concrete fix.\n' +
+  '2. A COMPLETE refactored rewrite of EVERY function, each with a full docstring.\n' +
+  '3. A comprehensive unit-test suite with several cases per function.\n' +
+  '4. A closing rationale explaining the most important changes and trade-offs.\n' +
+  'Keep going until all four sections are fully written; do not stop early and do ' +
+  'not ask any questions.'
+
+const PROFILES = {
+  light: { name: 'light', prompt: LIGHT_PROMPT, maxOutputTokens: 2048, defaultTimeoutSecs: 240, localTimeoutSecs: 600 },
+  heavy: { name: 'heavy', prompt: HEAVY_PROMPT, maxOutputTokens: 8192, defaultTimeoutSecs: 600, localTimeoutSecs: 1200 },
+}
+const DEFAULT_PROFILE = 'light'
+
+// Light-profile timeouts kept as named constants for the --help text.
+const DEFAULT_TIMEOUT_SECS = PROFILES.light.defaultTimeoutSecs
+const LOCAL_TIMEOUT_SECS = PROFILES.light.localTimeoutSecs   // a cold MLX weight-load can be slow
 
 // ----------------------------------------------------------------------------
 // CLI args.
 //   --models all                 benchmark every callable model (local discovered live)
 //   --models <sel>[,<sel>...]    a custom subset (see selection grammar below)
+//   --profile light|heavy        workload size (default light). heavy = >5k-token
+//                                input context + long-output task (>5k decode).
+//   --heavy / --light            shorthand for --profile heavy / --profile light
 //   --list                       dry-run: print what WOULD be benchmarked, make no calls
 //   --timeout <secs>             override the default per-call timeout
 //   --help
@@ -92,15 +173,19 @@ const LOCAL_TIMEOUT_SECS = 600   // a cold MLX weight-load can be slow
 //   fl-bench.mjs --list --models all       # show the plan, call nothing
 // ----------------------------------------------------------------------------
 function parseArgs(argv) {
-  const out = { models: 'all', list: false, timeout: null, help: false }
+  const out = { models: 'all', list: false, timeout: null, help: false, profile: DEFAULT_PROFILE }
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]
     if (a === '--help' || a === '-h') out.help = true
     else if (a === '--list' || a === '--dry-run') out.list = true
     else if (a === '--models' || a === '-m') out.models = argv[++i]
     else if (a === '--timeout') out.timeout = Number(argv[++i])
+    else if (a === '--profile') out.profile = String(argv[++i] || '').toLowerCase()
+    else if (a === '--heavy') out.profile = 'heavy'
+    else if (a === '--light') out.profile = 'light'
     else if (a.startsWith('--models=')) out.models = a.slice('--models='.length)
     else if (a.startsWith('--timeout=')) out.timeout = Number(a.slice('--timeout='.length))
+    else if (a.startsWith('--profile=')) out.profile = a.slice('--profile='.length).toLowerCase()
   }
   return out
 }
@@ -108,12 +193,17 @@ function parseArgs(argv) {
 const USAGE = `fl-bench.mjs — Farnsworth Loop throughput benchmark (cold vs hot tok/s)
 
 Usage:
-  fl-bench.mjs [--models <selection>] [--list] [--timeout <secs>]
+  fl-bench.mjs [--models <selection>] [--profile light|heavy] [--list] [--timeout <secs>]
 
 Options:
   --models <sel>   What to benchmark. Default: all. Comma-separated. See grammar.
+  --profile <p>    Workload profile (default ${DEFAULT_PROFILE}). light = ~200-word paragraph
+                   (cap ${PROFILES.light.maxOutputTokens}); heavy = >5k-token input context + long-output
+                   task (cap ${PROFILES.heavy.maxOutputTokens}), to measure real coding-sized throughput.
+                   Shorthand: --heavy / --light.
   --list           Dry-run: print the resolved plan and make NO model calls.
-  --timeout <secs> Per-call wall-clock backstop (default ${DEFAULT_TIMEOUT_SECS}, local ${LOCAL_TIMEOUT_SECS}).
+  --timeout <secs> Per-call wall-clock backstop (light default ${DEFAULT_TIMEOUT_SECS}/local ${LOCAL_TIMEOUT_SECS};
+                   heavy default ${PROFILES.heavy.defaultTimeoutSecs}/local ${PROFILES.heavy.localTimeoutSecs}).
   --help           This help.
 
 Selection grammar (comma-separated, de-duped):
@@ -244,55 +334,94 @@ function resolveSelection(sel, catalogue) {
 }
 
 // ============================================================================
-// Defensive token extraction for the claude-family `--output-format json`.
+// Defensive result extraction for the claude-family `--output-format json`.
 // That output is a JSON ARRAY of stream events; the final type:"result" element
-// carries usage.output_tokens. We DO NOT do JSON.parse(stdout).usage — that is
-// wrong for the real array output. We parse the array (or object), then walk
-// the whole structure recursively and take the MAX output_tokens we can find,
-// which lands on the cumulative final-result usage regardless of exact shape.
+// carries usage.{output,input}_tokens plus is_error and a `result` string. We DO
+// NOT do JSON.parse(stdout).usage — that is wrong for the real array output. We
+// parse the array (or object, or line-by-line), then walk the whole structure
+// recursively and collect, defensively:
+//   - outputTokens  = MAX usage.output_tokens (cumulative final-result usage)
+//   - inputTokens   = MAX (input_tokens + cache_read + cache_creation), i.e. the
+//                     true prompt size whether or not the input was cached (the
+//                     HOT call re-reads the same prompt from cache)
+//   - isError       = the FINAL type:"result" element's is_error (NOT a whole-tree
+//                     OR: an intermediate tool_result with is_error:true must not
+//                     fail a completed run — that over-detection was a D-0005
+//                     regression an adversarial review caught)
+//   - resultText    = the result/error string from that final result element
 // ============================================================================
-function maxOutputTokensDeep(node) {
-  let best = 0
+function extractClaudeResult(stdout) {
+  let root = null
+  if (stdout && stdout.trim()) {
+    try { root = JSON.parse(stdout) }
+    catch {
+      // line-by-line fallback (interleaved --verbose stream-json objects)
+      const arr = []
+      for (const line of stdout.split(/\r?\n/)) {
+        const s = line.trim()
+        if (!s || (s[0] !== '{' && s[0] !== '[')) continue
+        try { arr.push(JSON.parse(s)) } catch { /* skip */ }
+      }
+      if (arr.length) root = arr
+    }
+  }
+  if (root == null) return { parsed: false, outputTokens: 0, inputTokens: 0, isError: false, resultText: '' }
+  let outputTokens = 0, inputTokens = 0, isError = false, resultText = ''
   const visit = n => {
     if (n == null) return
     if (Array.isArray(n)) { for (const e of n) visit(e); return }
-    if (typeof n === 'object') {
-      // usage.output_tokens (Anthropic) anywhere in the tree
-      if (n.usage && typeof n.usage === 'object') {
-        const ot = Number(n.usage.output_tokens)
-        if (Number.isFinite(ot) && ot > best) best = ot
-        // some shapes nest a server_tool_use / cache fields; output_tokens is the one we want
-      }
-      // a bare output_tokens sitting at this level
-      const direct = Number(n.output_tokens)
-      if (Number.isFinite(direct) && direct > best) best = direct
-      for (const k of Object.keys(n)) visit(n[k])
+    if (typeof n !== 'object') return
+    if (n.usage && typeof n.usage === 'object') {
+      const u = n.usage
+      const ot = Number(u.output_tokens); if (Number.isFinite(ot) && ot > outputTokens) outputTokens = ot
+      const inTot = (Number(u.input_tokens) || 0) +
+        (Number(u.cache_read_input_tokens) || 0) + (Number(u.cache_creation_input_tokens) || 0)
+      if (inTot > inputTokens) inputTokens = inTot
     }
+    const direct = Number(n.output_tokens); if (Number.isFinite(direct) && direct > outputTokens) outputTokens = direct
+    // is_error / resultText come ONLY from the authoritative final type:"result"
+    // element — never a whole-tree OR. An intermediate stream event (e.g. a
+    // tool_result with is_error:true) must NOT mark a completed run as failed.
+    if (n.type === 'result') {
+      isError = n.is_error === true
+      if (typeof n.result === 'string') resultText = n.result
+    }
+    for (const k of Object.keys(n)) visit(n[k])
   }
-  visit(node)
-  return best
+  visit(root)
+  return { parsed: true, outputTokens, inputTokens, isError, resultText }
 }
 
-// Parse claude --output-format json stdout robustly. It is normally a JSON array,
-// but be defensive: try whole-string parse first; if that fails, try to parse
-// each line as a JSON object (stream-json fallback) and collect.
-function parseClaudeJsonTokens(stdout) {
-  if (!stdout || !stdout.trim()) return { tokens: 0, parsed: false }
-  // 1) whole-string parse (the documented array shape)
-  try {
-    const j = JSON.parse(stdout)
-    const t = maxOutputTokensDeep(j)
-    if (t > 0) return { tokens: t, parsed: true }
-    // parsed but no tokens found — fall through to line scan as a backstop
-  } catch { /* not a single JSON value; try line-by-line */ }
-  // 2) line-by-line (in case --verbose interleaved stream-json objects)
-  let best = 0, anyParsed = false
-  for (const line of stdout.split(/\r?\n/)) {
-    const s = line.trim()
-    if (!s || (s[0] !== '{' && s[0] !== '[')) continue
-    try { const o = JSON.parse(s); anyParsed = true; const t = maxOutputTokensDeep(o); if (t > best) best = t } catch { /* skip */ }
+// PURE outcome decision from (exit status, extracted result). This is the D-0005
+// fix and is unit-tested directly (no claude spawn needed):
+//   - A COMPLETED result with real output_tokens is SUCCESS even when the CLI
+//     exit code is nonzero (glm-5.1 exited 1 with outputTokens:256 — the old code
+//     bailed on the exit code and discarded a valid measurement).
+//   - An is_error result (e.g. haiku's `400 thinking.enabled.budget_tokens >=
+//     1024` from too small a cap) reports the REAL reason, not a bare "exit 1".
+//   - Timeout (124) and unparseable/empty output still fail, as before.
+function decideClaudeOutcome(status, ex, timeoutSecs) {
+  if (status === 124) return { ok: false, tokens: 0, inputTokens: 0, error: `timeout after ${timeoutSecs}s` }
+  // Salvage FIRST: a completed result with real output tokens is a valid throughput
+  // measurement regardless of the CLI exit code OR an is_error flag (e.g. an
+  // error_max_turns / refusal that still produced tokens). Tokens-produced wins —
+  // this is the core D-0005 fix, and is checked BEFORE is_error so an intermediate
+  // or result-level error can't discard a real measurement.
+  if (ex.parsed && ex.outputTokens > 0) {
+    return { ok: true, tokens: ex.outputTokens, inputTokens: ex.inputTokens || 0, error: '' }
   }
-  return { tokens: best, parsed: anyParsed }
+  if (ex.parsed && ex.isError) {
+    const why = ex.resultText ? ex.resultText.replace(/\s+/g, ' ').trim().slice(0, 200) : `is_error (claude exit ${status})`
+    return { ok: false, tokens: 0, inputTokens: ex.inputTokens || 0, error: `claude API error: ${why}` }
+  }
+  if (status !== 0) {
+    const tail = ex.resultText ? `: ${ex.resultText.replace(/\s+/g, ' ').trim().slice(0, 160)}` : ''
+    return { ok: false, tokens: 0, inputTokens: ex.inputTokens || 0, error: `claude exit ${status}: no usable completed result${tail}` }
+  }
+  return {
+    ok: false, tokens: 0, inputTokens: ex.inputTokens || 0,
+    error: ex.parsed ? 'claude completed but reported 0 output tokens (empty modelUsage)' : 'could not parse claude JSON output',
+  }
 }
 
 // ============================================================================
@@ -317,9 +446,10 @@ function perlAlarmArgv(timeoutSecs, cmdArgv) {
 // Run a claude-family call (anthropic/glm/minimax) and time JUST this call.
 // env: the provider-specific ANTHROPIC_* env (auth, base url, default models).
 // flagArgv: extra `claude` args (e.g. ['--model','opus']) — [] for minimax.
-function runClaudeFamily({ env, flagArgv, timeoutSecs }) {
+// cfg: the resolved profile { prompt, maxOutputTokens, ... }.
+function runClaudeFamily({ env, flagArgv, timeoutSecs, cfg }) {
   const claudeArgs = [
-    '-p', PROMPT,
+    '-p', cfg.prompt,
     ...flagArgv,
     '--output-format', 'json',
     '--verbose',                 // ensure the result/usage event is emitted
@@ -330,8 +460,10 @@ function runClaudeFamily({ env, flagArgv, timeoutSecs }) {
   const fullEnv = {
     ...process.env,
     ...env,
-    // SOFT output cap for claude-family (no --max-tokens flag exists).
-    CLAUDE_CODE_MAX_OUTPUT_TOKENS: String(MAX_OUTPUT_TOKENS),
+    // SOFT output cap for claude-family (no --max-tokens flag exists). MUST be
+    // >= 1024 or an extended-thinking model rejects the request with a 400 (the
+    // root cause of D-0005's haiku failure); profile caps are 2048 / 8192.
+    CLAUDE_CODE_MAX_OUTPUT_TOKENS: String(cfg.maxOutputTokens),
   }
   const t0 = Date.now()
   const r = spawnSync('perl', argv, {
@@ -341,26 +473,21 @@ function runClaudeFamily({ env, flagArgv, timeoutSecs }) {
     maxBuffer: 64 * 1024 * 1024,
   })
   const secs = (Date.now() - t0) / 1000
-  if (r.status === 124) return { ok: false, secs, tokens: 0, estimated: false, error: `timeout after ${timeoutSecs}s` }
-  if (r.status !== 0) {
-    const tail = ((r.stderr || '') + (r.stdout || '')).trim().slice(-300)
-    return { ok: false, secs, tokens: 0, estimated: false, error: `claude exit ${r.status}: ${tail || 'no output'}` }
-  }
-  const { tokens, parsed } = parseClaudeJsonTokens(r.stdout)
-  if (!parsed || tokens <= 0) {
-    return { ok: false, secs, tokens: 0, estimated: false, error: 'could not extract usage.output_tokens from claude JSON output' }
-  }
-  return { ok: true, secs, tokens, estimated: false, error: '' }
+  // D-0005: parse stdout FIRST, then decide — a completed result is salvaged even
+  // on a nonzero CLI exit; an is_error result reports the real reason.
+  const ex = extractClaudeResult(r.stdout)
+  const d = decideClaudeOutcome(r.status, ex, timeoutSecs)
+  return { ok: d.ok, secs, tokens: d.tokens, inputTokens: d.inputTokens, estimated: false, error: d.error }
 }
 
 // Anthropic — session's own auth; do NOT inject any ANTHROPIC_AUTH_TOKEN/base url.
-function dispatchAnthropic(target, timeoutSecs) {
-  return runClaudeFamily({ env: {}, flagArgv: ['--model', target.alias], timeoutSecs })
+function dispatchAnthropic(target, timeoutSecs, cfg) {
+  return runClaudeFamily({ env: {}, flagArgv: ['--model', target.alias], timeoutSecs, cfg })
 }
 
 // GLM — z.ai endpoint, Bearer via ZAI_API_KEY, default-model env (mirrors glm-run.sh).
-function dispatchGlm(target, timeoutSecs) {
-  if (!process.env.ZAI_API_KEY) return { ok: false, secs: 0, tokens: 0, estimated: false, error: 'ZAI_API_KEY unset' }
+function dispatchGlm(target, timeoutSecs, cfg) {
+  if (!process.env.ZAI_API_KEY) return { ok: false, secs: 0, tokens: 0, inputTokens: 0, estimated: false, error: 'ZAI_API_KEY unset' }
   const env = {
     ANTHROPIC_BASE_URL: 'https://api.z.ai/api/anthropic',
     ANTHROPIC_AUTH_TOKEN: process.env.ZAI_API_KEY,           // Bearer (NOT x-api-key)
@@ -368,13 +495,13 @@ function dispatchGlm(target, timeoutSecs) {
     ANTHROPIC_DEFAULT_SONNET_MODEL: 'glm-4.7',
     ANTHROPIC_DEFAULT_HAIKU_MODEL: 'glm-4.5-air',
   }
-  return runClaudeFamily({ env, flagArgv: ['--model', target.flag], timeoutSecs })
+  return runClaudeFamily({ env, flagArgv: ['--model', target.flag], timeoutSecs, cfg })
 }
 
 // MiniMax — MiniMax endpoint, Bearer via MINIMAX_API_KEY, ANTHROPIC_MODEL pins
 // MiniMax-M3, no --model flag (mirrors minimax-run.sh).
-function dispatchMinimax(_target, timeoutSecs) {
-  if (!process.env.MINIMAX_API_KEY) return { ok: false, secs: 0, tokens: 0, estimated: false, error: 'MINIMAX_API_KEY unset' }
+function dispatchMinimax(_target, timeoutSecs, cfg) {
+  if (!process.env.MINIMAX_API_KEY) return { ok: false, secs: 0, tokens: 0, inputTokens: 0, estimated: false, error: 'MINIMAX_API_KEY unset' }
   const env = {
     ANTHROPIC_BASE_URL: 'https://api.minimax.io/anthropic',
     ANTHROPIC_AUTH_TOKEN: process.env.MINIMAX_API_KEY,        // Bearer
@@ -386,19 +513,19 @@ function dispatchMinimax(_target, timeoutSecs) {
     CLAUDE_CODE_AUTO_COMPACT_WINDOW: '512000',
     API_TIMEOUT_MS: '3000000',
   }
-  return runClaudeFamily({ env, flagArgv: [], timeoutSecs })
+  return runClaudeFamily({ env, flagArgv: [], timeoutSecs, cfg })
 }
 
 // Local (omlx MLX) — call the OpenAI-shaped /v1/chat/completions endpoint
 // DIRECTLY via curl so we get a clean usage.completion_tokens and a clean
 // HTTP-only timing window (no `claude` agent overhead). Bearer via OMLX_AUTH_TOKEN.
-function dispatchLocal(target, timeoutSecs) {
+function dispatchLocal(target, timeoutSecs, cfg) {
   const tok = process.env.OMLX_AUTH_TOKEN
-  if (!tok) return { ok: false, secs: 0, tokens: 0, estimated: false, error: 'OMLX_AUTH_TOKEN unset' }
+  if (!tok) return { ok: false, secs: 0, tokens: 0, inputTokens: 0, estimated: false, error: 'OMLX_AUTH_TOKEN unset' }
   const body = JSON.stringify({
     model: target.id,
-    messages: [{ role: 'user', content: PROMPT }],
-    max_tokens: MAX_OUTPUT_TOKENS,           // omlx honours a hard cap
+    messages: [{ role: 'user', content: cfg.prompt }],
+    max_tokens: cfg.maxOutputTokens,         // omlx honours a hard cap
     temperature: 0,
     stream: false,
   })
@@ -412,15 +539,16 @@ function dispatchLocal(target, timeoutSecs) {
   const t0 = Date.now()
   const r = spawnSync('curl', curlArgv, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024 })
   const secs = (Date.now() - t0) / 1000
-  if (r.status !== 0) return { ok: false, secs, tokens: 0, estimated: false, error: `curl exit ${r.status} (omlx unreachable/timeout)` }
+  if (r.status !== 0) return { ok: false, secs, tokens: 0, inputTokens: 0, estimated: false, error: `curl exit ${r.status} (omlx unreachable/timeout)` }
   let j
-  try { j = JSON.parse(r.stdout) } catch { return { ok: false, secs, tokens: 0, estimated: false, error: `omlx returned non-JSON: ${(r.stdout || '').trim().slice(0, 200)}` } }
-  if (j && j.error) return { ok: false, secs, tokens: 0, estimated: false, error: `omlx error: ${typeof j.error === 'string' ? j.error : JSON.stringify(j.error).slice(0, 200)}` }
+  try { j = JSON.parse(r.stdout) } catch { return { ok: false, secs, tokens: 0, inputTokens: 0, estimated: false, error: `omlx returned non-JSON: ${(r.stdout || '').trim().slice(0, 200)}` } }
+  if (j && j.error) return { ok: false, secs, tokens: 0, inputTokens: 0, estimated: false, error: `omlx error: ${typeof j.error === 'string' ? j.error : JSON.stringify(j.error).slice(0, 200)}` }
   const ct = Number(j && j.usage && j.usage.completion_tokens)
+  const pt = Number(j && j.usage && j.usage.prompt_tokens)
   if (!Number.isFinite(ct) || ct <= 0) {
-    return { ok: false, secs, tokens: 0, estimated: false, error: 'omlx response missing usage.completion_tokens' }
+    return { ok: false, secs, tokens: 0, inputTokens: Number.isFinite(pt) ? pt : 0, estimated: false, error: 'omlx response missing usage.completion_tokens' }
   }
-  return { ok: true, secs, tokens: ct, estimated: false, error: '' }
+  return { ok: true, secs, tokens: ct, inputTokens: Number.isFinite(pt) ? pt : 0, estimated: false, error: '' }
 }
 
 // Codex (gpt-5.5) — `codex exec`, auth from ~/.codex/auth.json (no env key). We
@@ -428,7 +556,7 @@ function dispatchLocal(target, timeoutSecs) {
 // token reporting is unreliable across versions, so if no usage is found we fall
 // back to a chars/4 estimate of the captured final message (estimated:true) —
 // the ONE legitimate estimation per the constraints.
-function dispatchCodex(target, timeoutSecs) {
+function dispatchCodex(target, timeoutSecs, cfg) {
   // Pull the codex final message to its own file (clean capture), like codex-run.sh.
   const lastFile = resolve(RESULTS_DIR, `_codex_last_${target.id}.txt`)
   const codexArgs = [
@@ -441,24 +569,24 @@ function dispatchCodex(target, timeoutSecs) {
     '-o', lastFile,
     '-m', 'gpt-5.5',
     '-c', `model_reasoning_effort=${target.effort}`,
-    PROMPT,
+    cfg.prompt,
   ]
   const argv = perlAlarmArgv(timeoutSecs, ['codex', ...codexArgs])
   const t0 = Date.now()
   const r = spawnSync('perl', argv, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024 })
   const secs = (Date.now() - t0) / 1000
-  if (r.status === 124) return { ok: false, secs, tokens: 0, estimated: false, error: `timeout after ${timeoutSecs}s` }
+  if (r.status === 124) return { ok: false, secs, tokens: 0, inputTokens: 0, estimated: false, error: `timeout after ${timeoutSecs}s` }
   const out = (r.stdout || '')
   // terminal model/auth/version failure -> fail closed (mirrors codex-run.sh guard)
   if (/requires a newer version of Codex|is not supported when using Codex with a|invalid_api_key|401 Unauthorized|403 Forbidden/i.test(out + (r.stderr || ''))) {
-    return { ok: false, secs, tokens: 0, estimated: false, error: 'codex model/auth/version failure (see codex output)' }
+    return { ok: false, secs, tokens: 0, inputTokens: 0, estimated: false, error: 'codex model/auth/version failure (see codex output)' }
   }
   if (r.status !== 0) {
     const tail = ((r.stderr || '') + out).trim().slice(-300)
-    return { ok: false, secs, tokens: 0, estimated: false, error: `codex exit ${r.status}: ${tail || 'no output'}` }
+    return { ok: false, secs, tokens: 0, inputTokens: 0, estimated: false, error: `codex exit ${r.status}: ${tail || 'no output'}` }
   }
-  // 1) try to find a REAL token count in the --json event stream.
-  let realTokens = 0
+  // 1) try to find REAL token counts in the --json event stream (output + input).
+  let realTokens = 0, realInput = 0
   for (const line of out.split(/\r?\n/)) {
     const s = line.trim()
     if (!s || s[0] !== '{') continue
@@ -470,9 +598,15 @@ function dispatchCodex(target, timeoutSecs) {
         (o && o.info && o.info.token_usage && (o.info.token_usage.output_tokens ?? o.info.token_usage.total_tokens))
       const n = Number(cand)
       if (Number.isFinite(n) && n > realTokens) realTokens = n
+      const inCand =
+        (o && o.token_count && (o.token_count.input_tokens ?? o.token_count.prompt_tokens)) ??
+        (o && o.usage && (o.usage.input_tokens ?? o.usage.prompt_tokens)) ??
+        (o && o.info && o.info.token_usage && (o.info.token_usage.input_tokens ?? o.info.token_usage.prompt_tokens))
+      const m = Number(inCand)
+      if (Number.isFinite(m) && m > realInput) realInput = m
     } catch { /* skip */ }
   }
-  if (realTokens > 0) return { ok: true, secs, tokens: realTokens, estimated: false, error: '' }
+  if (realTokens > 0) return { ok: true, secs, tokens: realTokens, inputTokens: realInput, estimated: false, error: '' }
   // 2) FALLBACK (codex only): chars/4 estimate of the captured final message.
   let finalMsg = ''
   try { if (existsSync(lastFile)) finalMsg = require_readFileSync(lastFile) } catch { /* ignore */ }
@@ -483,9 +617,9 @@ function dispatchCodex(target, timeoutSecs) {
       try { const o = JSON.parse(s); const txt = o?.msg?.message || o?.item?.text || o?.text; if (typeof txt === 'string' && txt.length > finalMsg.length) finalMsg = txt } catch { /* skip */ }
     }
   }
-  if (!finalMsg.trim()) return { ok: false, secs, tokens: 0, estimated: false, error: 'codex produced no extractable final message or token count' }
+  if (!finalMsg.trim()) return { ok: false, secs, tokens: 0, inputTokens: realInput, estimated: false, error: 'codex produced no extractable final message or token count' }
   const est = Math.max(1, Math.round(finalMsg.length / 4))
-  return { ok: true, secs, tokens: est, estimated: true, error: '' }
+  return { ok: true, secs, tokens: est, inputTokens: realInput, estimated: true, error: '' }
 }
 
 // tiny lazy fs read (kept out of the top imports to avoid an unused symbol if codex never runs)
@@ -515,15 +649,15 @@ const DISPATCH = {
 // Each tok/s is derived from THAT call's OWN token count and seconds (cold and
 // hot do NOT generate the same number of output tokens, so we store both).
 // ============================================================================
-function benchOne(target, timeoutSecs) {
+function benchOne(target, timeoutSecs, cfg) {
   const dispatch = DISPATCH[target.provider]
   const tSecs = target.provider === 'local'
-    ? Math.max(timeoutSecs, LOCAL_TIMEOUT_SECS)   // local cold load can be slow
+    ? Math.max(timeoutSecs, cfg.localTimeoutSecs)   // local cold load can be slow
     : timeoutSecs
 
-  const cold = dispatch(target, tSecs)
+  const cold = dispatch(target, tSecs, cfg)
   // immediate HOT call (no sleep) — warm connection / resident weights
-  const hot = cold.ok ? dispatch(target, tSecs) : { ok: false, secs: 0, tokens: 0, estimated: false, error: 'skipped (cold failed)' }
+  const hot = cold.ok ? dispatch(target, tSecs, cfg) : { ok: false, secs: 0, tokens: 0, inputTokens: 0, estimated: false, error: 'skipped (cold failed)' }
 
   const tps = c => (c.ok && c.secs > 0 && c.tokens > 0) ? (c.tokens / c.secs) : null
   const coldTps = tps(cold)
@@ -536,12 +670,15 @@ function benchOne(target, timeoutSecs) {
   return {
     provider: target.provider,
     model: target.id,
+    profile: cfg.name,
     ok,
     cold_tok_s: coldTps != null ? round2(coldTps) : null,
     hot_tok_s: hotTps != null ? round2(hotTps) : null,
     delta_tok_s: (coldTps != null && hotTps != null) ? round2(hotTps - coldTps) : null,
     cold_tokens: cold.tokens || 0,
     hot_tokens: hot.tokens || 0,
+    cold_input_tokens: cold.inputTokens || 0,
+    hot_input_tokens: hot.inputTokens || 0,
     cold_secs: round2(cold.secs || 0),
     hot_secs: round2(hot.secs || 0),
     estimated: !!(cold.estimated || hot.estimated),   // true only for codex chars/4 fallback
@@ -582,8 +719,9 @@ function printTable(records) {
     ['COLD t/s', r => r.cold_tok_s == null ? '-' : String(r.cold_tok_s)],
     ['HOT t/s', r => r.hot_tok_s == null ? '-' : String(r.hot_tok_s)],
     ['Δ t/s', r => r.delta_tok_s == null ? '-' : (r.delta_tok_s >= 0 ? '+' : '') + r.delta_tok_s],
-    ['cTok', r => String(r.cold_tokens)],
-    ['hTok', r => String(r.hot_tokens)],
+    ['cIn', r => String(r.cold_input_tokens || 0)],
+    ['cOut', r => String(r.cold_tokens)],
+    ['hOut', r => String(r.hot_tokens)],
     ['cSec', r => String(r.cold_secs)],
     ['hSec', r => String(r.hot_secs)],
     ['STATUS', r => r.ok ? (r.estimated ? 'OK*' : 'OK') : 'FAIL'],
@@ -614,7 +752,12 @@ function main() {
   const args = parseArgs(process.argv.slice(2))
   if (args.help) { console.log(USAGE); return }
 
-  const baseTimeout = Number.isFinite(args.timeout) && args.timeout > 0 ? args.timeout : DEFAULT_TIMEOUT_SECS
+  const cfg = PROFILES[args.profile]
+  if (!cfg) {
+    console.error(`Unknown profile "${args.profile}". Choose one of: ${Object.keys(PROFILES).join(' | ')}.`)
+    process.exit(2)
+  }
+  const baseTimeout = Number.isFinite(args.timeout) && args.timeout > 0 ? args.timeout : cfg.defaultTimeoutSecs
 
   const { all, localNote } = buildCatalogue()
   if (localNote) console.error(`[local discovery] ${localNote}`)
@@ -628,15 +771,15 @@ function main() {
   }
 
   if (args.list) {
-    console.log(`Would benchmark ${picked.length} model(s) (cold + hot each):\n`)
+    console.log(`Would benchmark ${picked.length} model(s) (cold + hot each) on the "${cfg.name}" profile (output cap ${cfg.maxOutputTokens}):\n`)
     for (const t of picked) console.log(`  ${t.provider}:${t.id}`)
-    console.log(`\nPer-call timeout: ${baseTimeout}s (local: ${Math.max(baseTimeout, LOCAL_TIMEOUT_SECS)}s)`)
+    console.log(`\nPer-call timeout: ${baseTimeout}s (local: ${Math.max(baseTimeout, cfg.localTimeoutSecs)}s)`)
     console.log(`Results would append to: ${RESULTS_FILE}`)
     if (localNote) console.log(`\nNote: ${localNote}`)
     return
   }
 
-  console.error(`fl-bench: benchmarking ${picked.length} model(s); cold+hot each; prompt cap ~${MAX_OUTPUT_TOKENS} tokens.`)
+  console.error(`fl-bench: benchmarking ${picked.length} model(s) on the "${cfg.name}" profile; cold+hot each; output cap ${cfg.maxOutputTokens} tokens.`)
   console.error(`Results -> ${RESULTS_FILE}\n`)
 
   const records = []
@@ -645,13 +788,14 @@ function main() {
     process.stderr.write(`[${i + 1}/${picked.length}] ${t.provider}:${t.id} ... `)
     let rec
     try {
-      rec = benchOne(t, baseTimeout)
+      rec = benchOne(t, baseTimeout, cfg)
     } catch (e) {
       // honest failure: record + continue
       rec = {
-        provider: t.provider, model: t.id, ok: false,
+        provider: t.provider, model: t.id, profile: cfg.name, ok: false,
         cold_tok_s: null, hot_tok_s: null, delta_tok_s: null,
-        cold_tokens: 0, hot_tokens: 0, cold_secs: 0, hot_secs: 0,
+        cold_tokens: 0, hot_tokens: 0, cold_input_tokens: 0, hot_input_tokens: 0,
+        cold_secs: 0, hot_secs: 0,
         estimated: false, timestamp: localIso(),
         error: `harness exception: ${String(e && e.message || e).slice(0, 200)}`,
       }
@@ -670,4 +814,9 @@ function main() {
   console.log(`\n${okCount}/${records.length} models benchmarked successfully. Full history: ${RESULTS_FILE}`)
 }
 
-main()
+// Run main() only when executed as a CLI, so the pure helpers can be imported by
+// the test suite without triggering a benchmark sweep.
+const _isMain = process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url))
+if (_isMain) main()
+
+export { extractClaudeResult, decideClaudeOutcome, buildHeavyContext, PROFILES }
