@@ -17,7 +17,7 @@ Append new items; never renumber.
 | id     | sev  | area    | status | title                                                                            | evidence                 |
 |--------|------|---------|--------|----------------------------------------------------------------------------------|--------------------------|
 | D-0001 | sev1 | review  | open   | Blind Opus judge assumes `node:fs` exists; ranks fs-plans over correct haiku+Bash | docs/dogfood/D-0001.md   |
-| D-0004 | sev1 | review  | [in-progress] @rob 2026-06-15T01:14:58Z run:fl-fix-D0004-20260615-131458 | Non-Anthropic round-1 winner excluded from final pool (carryover provenance re-check) | docs/dogfood/D-0004.md |
+| D-0004 | sev1 | review  | done   | Non-Anthropic round-1 winner excluded from final pool (carryover provenance re-check) | docs/dogfood/D-0004.md |
 | D-0002 | sev2 | infra   | open   | Round-1 `verdict`/`guidance` silently not written on large two-pass runs         | docs/dogfood/D-0002.md   |
 | D-0003 | sev3 | parse   | open   | `fl-parse.mjs` mis-reads prose `1 grand loop` and `2x opus` shorthand             | docs/dogfood/D-0003.md   |
 
