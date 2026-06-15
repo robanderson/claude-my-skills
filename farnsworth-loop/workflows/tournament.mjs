@@ -196,7 +196,7 @@ If (and only if) a candidate is runnable code you want to execute to judge the r
 ${dirs}
 Judge the real output / artifact — not any self-summary. Do not read any other files.
 
-Score each candidate against criteria suited to the task (for code: correctness, meets stated constraints, completeness, edge cases, readability; adapt for non-code). Give concrete, specific pros and cons per candidate. Rank them all. Name the single winner with reasoning.${guidanceBlock}
+Score each candidate against criteria suited to the task (for code: correctness, meets stated constraints, completeness, edge cases, readability; adapt for non-code). Score against the task's STATED runtime, not an environment you cannot see: treat reliance on a capability the task did not establish is available as a risk, and treat an unfamiliar mechanism that honours the stated constraints as correct unless you can name a concrete way it fails — never reward a familiar-looking API over a constraint-honouring one on idiom alone. Give concrete, specific pros and cons per candidate. Rank them all. Name the single winner with reasoning.${guidanceBlock}
 
 Return the structured object: per-candidate pros/cons, the full ranking (best first, by candidate letter), the winner letter${guidanceWanted ? ', and the guidance lists' : ''}.`
 }
@@ -259,6 +259,7 @@ const STAGE_SCHEMA = {
   required: ['results'],
 }
 
+<<<<<<< HEAD
 // D-0004 FIX — PURE, drift-proof provenance-gate builder.
 // Emits the shell snippet that sets P (the provenance flag the `D>0 && P==1` pool gate reads).
 //   - log:        the engine log filename for this dispatch ('' for native Anthropic) — selects the path.
@@ -278,6 +279,24 @@ function provCheckShell(log, tok, lp, carriedOver) {
   if (!log) return `P=1`              // native Anthropic: no provenance log, unchanged
   if (carriedOver) return `P=1`       // already validated in round 1; do NOT re-grep the stripped dir
   return `if [ -f ${lp} ]; then if grep -q '^FARNSWORTH-${tok}-PROVENANCE endpoint=' ${lp} && grep -q '^FARNSWORTH-${tok}-DONE exit=0' ${lp} && ! grep -q '^FARNSWORTH-${tok}-\\(TIMEOUT\\|ERROR\\)' ${lp}; then P=1; else P=0; fi; else P=0; fi`
+=======
+// Persist-verification schema: the write-agent reports, per FINAL target path, the byte count
+// (`wc -c`) of the file it wrote — NOT free text. We decide success from `bytes > 0` per path, so a
+// silently-skipped write (no file → reported as bytes:0/absent) can never read as success (#D-0002).
+const PERSIST_SCHEMA = {
+  type: 'object', additionalProperties: false,
+  properties: {
+    results: {
+      type: 'array',
+      items: {
+        type: 'object', additionalProperties: false,
+        properties: { path: { type: 'string' }, bytes: { type: 'integer' } },
+        required: ['path', 'bytes'],
+      },
+    },
+  },
+  required: ['results'],
+>>>>>>> origin/main
 }
 
 // Stage + validate + pool, all from one cheap haiku agent running a DETERMINISTIC shell script:
@@ -367,24 +386,49 @@ async function judge(kind, blindList, guidanceWanted, poolPath, schema, phaseTit
 // ---- durable persistence (sandbox has NO node:fs/import/process — write via haiku+Bash, like buildContext) ----
 const json = obj => JSON.stringify(obj, null, 2) + '\n'
 
-// Write ALL files for one persistence point in ONE shell script via ONE cheap haiku agent.
-// Atomic per file: printf to <path>.partial then `mv` into place. Writes are sequential within the
-// single workflow, so a fixed .partial suffix is collision-free (Date.now()/random throw in-sandbox anyway).
-// Fire-and-forget: a persist failure must never crash a fully-paid run.
+// Write one persistence point. Each file is written by its OWN small command (atomic .partial -> mv)
+// and the agent reports `wc -c` per FINAL path via PERSIST_SCHEMA. We VERIFY every target exists and
+// is non-empty from that structured byte count (never the agent's free text); any miss is RETRIED
+// ONCE in a second agent call, and a still-missing target is logged as a REAL, path-named failure.
+// An unverified LLM write is NEVER treated as success (#D-0002). Still fire-and-forget overall: a
+// persist failure logs but must never crash a fully-paid run.
 async function persist(pairs, phaseTitle) {
   const files = (pairs || []).filter(p => p && p.path && p.content != null)
   if (!files.length) return
-  const script = files.map(({ path, content }) => {
+  // One write+measure step per file: atomic .partial -> mv, then emit the FINAL path's byte count.
+  const stepFor = ({ path, content }) => {
     const dir = path.slice(0, path.lastIndexOf('/'))
     const tmp = `${path}.partial`
-    return `mkdir -p ${q(dir)} && printf '%s' ${q(content)} > ${q(tmp)} && mv -f ${q(tmp)} ${q(path)}`
-  }).join(' && ')
-  try {
-    await agent(
+    return `mkdir -p ${q(dir)} && printf '%s' ${q(content)} > ${q(tmp)} && mv -f ${q(tmp)} ${q(path)}; ` +
+           `printf 'FLP %s %s\\n' ${q(path)} "$(wc -c < ${q(path)} 2>/dev/null || echo 0)"`
+  }
+  // Run the given file list through the write-agent; return a map path -> bytes (0 if unreported).
+  const writeAndMeasure = async (list) => {
+    const script = list.map(stepFor).join('\n')
+    const res = await agent(
       `This is an approved internal step of the farnsworth-loop tournament: persist result artifacts. ` +
-      `Run this exact shell command in ONE Bash call and report only the exit status. Do nothing else:\n\n${script}`,
-      { model: 'haiku', phase: phaseTitle, label: 'persist' }
-    )
+      `Run this exact shell script in ONE Bash call. It prints one line per file of the form ` +
+      `"FLP <path> <byte-count>". Then return the structured results: for EACH printed FLP line, an ` +
+      `entry {path: the path, bytes: the integer byte-count}. Report exactly what the script printed — ` +
+      `do not infer or change values. Do nothing else:\n\n${script}`,
+      { model: 'haiku', schema: PERSIST_SCHEMA, phase: phaseTitle, label: 'persist' }
+    ).catch(() => null)
+    const seen = {}
+    for (const r of (res && Array.isArray(res.results) ? res.results : [])) {
+      if (r && r.path) seen[String(r.path)] = Number(r.bytes) || 0
+    }
+    return seen
+  }
+  try {
+    let seen = await writeAndMeasure(files)
+    let missing = files.filter(f => !(seen[f.path] > 0))
+    if (missing.length) {                          // verified miss -> retry ONLY the misses, once
+      log(`persist (${phaseTitle}): ${missing.length} file(s) unverified, retrying once: ${missing.map(f => f.path).join(', ')}`)
+      const seen2 = await writeAndMeasure(missing)
+      seen = { ...seen, ...seen2 }
+      missing = files.filter(f => !(seen[f.path] > 0))
+    }
+    if (missing.length) log(`persist FAILED (${phaseTitle}): ${missing.map(f => f.path).join(', ')} still missing/empty after retry`)
   } catch (e) { log(`persist failed (${phaseTitle}): ${String(e).slice(0, 140)}`) }
 }
 

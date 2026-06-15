@@ -225,6 +225,44 @@ parseCase('Z=0 invalid', 'do abc @@FL:5:1:0',
 }
 
 // ===========================================================================
+// D-0003 — prose 'Nx <model>' multiplier + '<n> grand loop[s]' Z directive.
+// ===========================================================================
+
+// --- 'Nx <model>' is equivalent to 'N <model>' (no space before model) ---
+parseCase('Nx single spec', 'do x with 2x opus @@FL',
+  { n: 2, z: 1, assignment: ['opus', 'opus'], needsGate: false }, { noErrors: true });
+parseCase('Nx chained spec', 'build a parser with 2x opus and 1x codex high @@FL',
+  { task: 'build a parser', n: 3, z: 1, assignment: ['opus', 'opus', 'codex-high'] }, { noErrors: true });
+parseCase('Nx chained four with M=2', 'build x with 2x opus, 2x sonnet, 2x codex, 2x minimax @@FL:8:2',
+  { n: 8, mode: 2, z: 1,
+    assignment: ['opus', 'opus', 'sonnet', 'sonnet', 'codex-medium', 'codex-medium', 'minimax-m3', 'minimax-m3'] },
+  { noErrors: true });
+// 'Nx' agrees with an explicit marker N -> no conflict.
+parseCase('Nx agrees with marker N', 'do x with 2x opus and 1x sonnet @@FL:3',
+  { n: 3, z: 1, assignment: ['opus', 'opus', 'sonnet'] }, { noErrors: true });
+
+// --- '<n> grand loop[s]' is a Z directive: sets z, stripped from task/spec ---
+parseCase('grand loops sets Z, with spec', 'build x with 3 opus, 2 grand loops @@FL',
+  { n: 3, z: 2, assignment: ['opus', 'opus', 'opus'] }, { noErrors: true });
+parseCase('grand loop singular -> z=1', 'do abc with 2 opus, 1 grand loop @@FL',
+  { n: 2, z: 1, assignment: ['opus', 'opus'] }, { noErrors: true });
+parseCase('grand loops with explicit sigil N (no spec)', 'tidy up @@FL:3 2 grand loops',
+  { task: 'tidy up', n: 3, mode: 1, z: 2, assignment: null }, { noErrors: true });
+// 'grand' is NOT a model token -> the literal repro no longer errors.
+parseCase('grand loop does NOT error on "grand"', '@@FL 2 minimax, 1 grand loop, do X',
+  { n: 2, z: 1, assignment: ['minimax-m3', 'minimax-m3'] }, { noErrors: true });
+// A prose grand-loop count over the ceiling is rejected like the sigil Z.
+parseCase('grand loops over ceiling', 'tidy up @@FL:3 9 grand loops',
+  { n: null, z: 9 }, { errorIncludes: 'exceeds the grand-loop ceiling' });
+// Sigil :Z and prose 'N grand loops' that DISAGREE -> loud conflict error.
+parseCase('grand loop conflicts with sigil Z', 'improve X @@FL:4:1:2 with 3 grand loops',
+  {}, { errorIncludes: 'Grand-loop count conflict' });
+// Ordinary 'grand' as task noun (no count immediately before, no 'loop[s]' after)
+// is NOT treated as a directive and is left in the task text.
+parseCase('ordinary grand noun untouched', 'redesign the grand staircase @@FL:5',
+  { task: 'redesign the grand staircase', n: 5, z: 1, assignment: null }, { noErrors: true });
+
+// ===========================================================================
 // unit-level normaliser / helpers.
 // ===========================================================================
 unit('normalise opus', normaliseModel('opus') && normaliseModel('opus').model === 'opus');
