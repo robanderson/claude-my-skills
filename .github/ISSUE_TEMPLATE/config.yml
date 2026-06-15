@@ -1,5 +1,0 @@
-# The dogfood convention lives at
-# farnsworth-loop/skills/farnsworth-loop/references/dogfood.md (in this repo).
-# (No contact_link: GitHub requires an absolute URL there, which would hard-code
-# the owner/repo and break on forks; the dogfood.yml template references the path.)
-blank_issues_enabled: true
