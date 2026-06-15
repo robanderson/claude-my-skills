@@ -96,6 +96,19 @@ const MODEL_TOKEN_RX =
 // without treating ordinary '<digit> <noun>' task text as a spec.
 const CONNECTOR_BEFORE = '(?:with|using)';
 
+// Shared COUNT fragment for every spec regex: a leading integer count, with an
+// OPTIONAL multiplier 'x' (so '2x opus' == '2 opus'). The 'x' is OUTSIDE the
+// capture group so parseInt(m[1]) stays a clean integer (no post-strip hack).
+// Applied in lockstep to ITEM_RX, locateSpec/stripAll chainRx, expandSpec
+// itemFinder so the 'Nx' form is recognised everywhere a count can appear.
+const COUNT_RX = '(\\d+)x?\\s*';      // capturing form: '(\\d+)' + optional 'x'
+const COUNT_NC = '\\d+x?\\s*';        // non-capturing form (chain scans)
+
+// A '<n> grand loop[s]' phrase = the Z (grand-loop) directive in prose. It must
+// be recognised and STRIPPED before the model-spec scan runs, otherwise 'grand'
+// reaches the model-token recogniser and errors. Capture the integer in group 1.
+const GRAND_LOOP_RX = /(\d+)\s*grand\s+loops?\b/i;
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -163,7 +176,7 @@ const PROSE_RX = /farnsworth\s+loop(?:\s*:\s*(\d*))?(?:\s*:\s*(\d*))?(?:\s*:\s*(
 // ---------------------------------------------------------------------------
 
 // A single recognised item: <count> <model token>.
-const ITEM_RX = new RegExp('(\\d+)\\s*(' + MODEL_TOKEN_RX + ')', 'i');
+const ITEM_RX = new RegExp(COUNT_RX + '(' + MODEL_TOKEN_RX + ')', 'i');
 
 // Find the prose spec region in the message. Returns
 // { found, start, end, raw } where [start,end) is the slice to strip, or
@@ -174,8 +187,8 @@ function locateSpec(msg) {
   // We iterate item-by-item (NOT one giant variable-length capture) to reliably
   // capture middle items.
   const chainRx = new RegExp(
-    '(\\d+\\s*' + MODEL_TOKEN_RX + ')' +                       // first item
-    '(?:\\s*(?:,\\s*and|,|and)\\s*\\d+\\s*' + MODEL_TOKEN_RX + ')*', // more
+    '(' + COUNT_NC + MODEL_TOKEN_RX + ')' +                       // first item
+    '(?:\\s*(?:,\\s*and|,|and)\\s*' + COUNT_NC + MODEL_TOKEN_RX + ')*', // more
     'ig'
   );
 
@@ -202,7 +215,7 @@ function expandSpec(specRaw) {
   const assignment = [];
   const unknowns = [];
   // Iterate per item.
-  const itemFinder = new RegExp('(\\d+)\\s*(' + MODEL_TOKEN_RX + ')', 'ig');
+  const itemFinder = new RegExp(COUNT_RX + '(' + MODEL_TOKEN_RX + ')', 'ig');
   let m;
   let any = false;
   while ((m = itemFinder.exec(specRaw)) !== null) {
@@ -383,6 +396,36 @@ function parse(rawInput) {
       // z in [1..Z_MAX] is valid. z>=2 simply flows on; the SKILL gates it.
     }
   }
+  // A prose '<n> grand loop[s]' phrase is an alternative spelling of Z. Resolve it
+  // here, AFTER the sigil Z, mirroring the N marker-vs-prose precedence: the sigil
+  // :Z wins, and a disagreement between sigil :Z and prose is surfaced as an error
+  // (never silently guessed). When only the prose form is present it supplies Z;
+  // the same Z_MAX ceiling and >=1 floor apply. (GRAND_LOOP_RX is evaluated against
+  //  msg, which exists here; section 7 re-strips it from the spec-scan copy.)
+  const __grand = GRAND_LOOP_RX.exec(msg);
+  if (__grand) {
+    const zp = intSeg(__grand[1]).value;
+    if (zp === null || zp < 1) {
+      errors.push('Invalid grand-loop count "' + __grand[0].trim() +
+        '". The grand-loop count must be an integer >= 1.');
+    } else if (marker.zSeg.present && marker.zSeg.value !== null && marker.zSeg.value !== zp) {
+      // Both a sigil :Z and a prose 'N grand loop[s]' given and they disagree.
+      errors.push('Grand-loop count conflict: sigil Z=' + marker.zSeg.value +
+        ' but prose says ' + zp + ' grand loop(s). State Z once.');
+    } else if (!marker.zSeg.present) {
+      // Only the prose form sets Z — apply the same ceiling/floor as the sigil.
+      if (zp > Z_MAX) {
+        z = zp;
+        errors.push(
+          'Z=' + zp + ' exceeds the grand-loop ceiling Z_MAX=' + Z_MAX +
+          '. This is a runaway-safety bound (not a cost cap). Split into batches: ' +
+          'run several invocations with Z<=' + Z_MAX + ' instead.'
+        );
+      } else {
+        z = zp;
+      }
+    }
+  }
   result.z = z;
 
   // --- 6. Sigil/marker N. ---
@@ -397,21 +440,29 @@ function parse(rawInput) {
   }
 
   // --- 7. Prose model spec scan + Top Mixed. ---
-  // Work against the FULL message (spec/keyword can appear anywhere).
+  // Work against the message (spec/keyword can appear anywhere). FIRST strip the
+  // prose '<n> grand loop[s]' directive (its Z was resolved in section 5): the
+  // literal word 'grand' would otherwise reach the model-token recogniser and
+  // error. Build a SCAN COPY with that phrase removed and run EVERY downstream
+  // scan (locateSpec / locateUnknownNearConnector / Top-Mixed) against the copy,
+  // so the stray token never reaches the recogniser. (Task text is cleaned in
+  // stripAll.)
+  const scanMsg = GRAND_LOOP_RX.test(msg) ? msg.replace(GRAND_LOOP_RX, ' ') : msg;
+
   let assignment = null;
   let preset = null;
   let nSpec = null;
 
-  const topMixedPresent = TOP_MIXED_RX.test(msg);
+  const topMixedPresent = TOP_MIXED_RX.test(scanMsg);
   let topMixedLeadCount = null;
-  const tmLead = TOP_MIXED_LEADCOUNT_RX.exec(msg);
+  const tmLead = TOP_MIXED_LEADCOUNT_RX.exec(scanMsg);
   if (tmLead) topMixedLeadCount = parseInt(tmLead[1], 10);
 
   // Locate a recognised-item spec (not Top Mixed).
-  const spec = locateSpec(msg);
+  const spec = locateSpec(scanMsg);
 
   // Connector-licensed unknown tokens (loud rejection of typos).
-  const unknownHits = locateUnknownNearConnector(msg);
+  const unknownHits = locateUnknownNearConnector(scanMsg);
 
   if (topMixedPresent) {
     preset = 'top-mixed';
@@ -550,6 +601,9 @@ function isEmptyFirstColonSeg(rawTail) {
 function stripAll(preMarkerTask, spec, fullMsg, marker) {
   let t = preMarkerTask;
 
+  // Remove a prose '<n> grand loop[s]' directive (it carried Z, not task content).
+  t = t.replace(/(\d+)\s*grand\s+loops?\b/ig, ' ');
+
   // Remove top-mixed phrases (with optional leading count) from the task.
   t = t.replace(/(\d+\s*)?top[\s-]*mix(?:ed)?/ig, ' ');
 
@@ -557,8 +611,8 @@ function stripAll(preMarkerTask, spec, fullMsg, marker) {
   // on the task text only (the spec may have been before the marker).
   const chainRx = new RegExp(
     '(?:\\bwith\\b|\\busing\\b)?\\s*' +
-    '(\\d+\\s*' + MODEL_TOKEN_RX + ')' +
-    '(?:\\s*(?:,\\s*and|,|and)\\s*\\d+\\s*' + MODEL_TOKEN_RX + ')*',
+    '(' + COUNT_NC + MODEL_TOKEN_RX + ')' +
+    '(?:\\s*(?:,\\s*and|,|and)\\s*' + COUNT_NC + MODEL_TOKEN_RX + ')*',
     'ig'
   );
   t = t.replace(chainRx, ' ');
