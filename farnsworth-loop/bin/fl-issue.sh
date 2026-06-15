@@ -14,10 +14,8 @@
 #   check-evidence FILE       run ONLY the evidence guards (no network; for tests)
 #   next                      print the top open dogfood issue number (sev1->sev3)
 #   claim     N RUN-ID        best-effort claim issue N (see references/dogfood.md)
-#   release   N               drop your claim on issue N
-#   archive   N               snapshot closed issue N -> docs/dogfood/archive/D-N.md
+#   release   N [RUN-ID]      drop your claim on issue N
 #   drain-inbox               file any committed docs/dogfood/inbox/*.md via `new`
-#   import-archive            ONE-OFF migration: legacy DOGFOOD.md rows -> closed issues
 #
 # Guards return distinct exit codes so callers/tests can branch:
 #   3 = evidence empty / placeholder   4 = unblinding (blind->model / mapping.json)
@@ -32,9 +30,7 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PLUGIN_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"              # farnsworth-loop/
 DOGFOOD_DIR="$PLUGIN_ROOT/docs/dogfood"
-ARCHIVE_DIR="$DOGFOOD_DIR/archive"
 INBOX_DIR="$DOGFOOD_DIR/inbox"
-ROSTER="$PLUGIN_ROOT/DOGFOOD.md"                         # legacy; read by import-archive only
 
 MARKER="dogfood"                                         # label every FL item carries
 TITLE_PREFIX="[dogfood] "
@@ -72,15 +68,6 @@ check_evidence() {
     return 5
   fi
   return 0
-}
-
-# scrub_stream: stdin -> stdout, strip unblinding lines / redact blind->model.
-# Defensive belt for bodies built from existing material (e.g. migration).
-scrub_stream() {
-  sed -E \
-    -e '/mapping\.json/Id' \
-    -e '/"candidate"[[:space:]]*:[[:space:]]*"[A-Z]"/d' \
-    -e 's/(blind[[:space:]]+[A-Z][[:space:]]*(=|->|:|is|was)[[:space:]]*(the[[:space:]]+)?)(opus|sonnet|haiku|glm[^[:space:]]*|codex[^[:space:]]*|minimax[^[:space:]]*|gpt[^[:space:]]*|claude[^[:space:]]*)/\1[model redacted]/Ig'
 }
 
 # ---------------------------------------------------------------------------
@@ -214,49 +201,32 @@ cmd_claim() {
   gh_ok || die "gh unavailable."
   local n="${1:?claim: issue number}" runid="${2:?claim: run-id}" me
   me="$(gh api user --jq .login 2>/dev/null)" || die "claim: cannot resolve gh user."
-  # 1. read — bail if a fresh claim already holds it (TTL handled by the caller/SKILL).
-  local cur; cur="$(gh issue view "$n" --json assignees,labels \
-      --jq '{a:[.assignees[].login], claimed:(.labels|map(.name)|index("claimed")!=null)}' 2>/dev/null)" \
-      || die "claim: cannot read issue #$n."
-  # 2. write — add self + marker + a durable claim comment carrying the run-id.
+  # IDENTITY IS THE RUN-ID, not the gh login: @@FL workers usually share ONE gh account,
+  # so assignee/login cannot disambiguate two concurrent runs. The durable `claim: run:<id>`
+  # comment is the lock; the assignee + `claimed` label are just visible state.
+  # 1. announce our claim (carries our run-id).
+  gh issue comment "$n" --body "claim: run:$runid by:@$me at:$(now)" >/dev/null 2>&1 \
+    || die "claim: cannot comment on #$n."
   gh issue edit "$n" --add-assignee @me --add-label claimed >/dev/null 2>&1
-  gh issue comment "$n" --body "claim: @$me run:\`$runid\` $(now)" >/dev/null 2>&1
-  # 3. read-after-write — if multiple assignees, deterministic tiebreak:
-  #    the LOWEST-numbered claim comment wins; only the loser releases (livelock-free).
-  local assignees; assignees="$(gh issue view "$n" --json assignees --jq '.assignees|length' 2>/dev/null)"
-  if [ "${assignees:-1}" -gt 1 ]; then
-    local winner
-    winner="$(gh issue view "$n" --json comments \
-      --jq '[.comments[]|select(.body|startswith("claim: "))]|sort_by(.url)|.[0].author.login' 2>/dev/null)"
-    if [ "$winner" != "$me" ]; then
-      info "lost claim race on #$n to @$winner — releasing."
-      gh issue edit "$n" --remove-assignee @me >/dev/null 2>&1
-      return 2
-    fi
+  # 2. deterministic tiebreak: the EARLIEST `claim: run:` comment wins. Livelock-free —
+  #    only losers back off; once the comments exist the winning run-id is fixed.
+  local winner
+  winner="$(gh issue view "$n" --json comments \
+    --jq '[.comments[]|select(.body|test("^claim: run:"))]|sort_by(.createdAt,.url)|.[0].body|capture("run:(?<r>[^ ]+)").r' 2>/dev/null)"
+  if [ -n "$winner" ] && [ "$winner" != "$runid" ]; then
+    info "lost claim on #$n: run:$winner got there first (mine run:$runid) — backing off."
+    gh issue comment "$n" --body "release: run:$runid (superseded by run:$winner)" >/dev/null 2>&1
+    return 2
   fi
-  info "claimed #$n as @$me (run:$runid). NOTE: best-effort, not a mutex."
+  info "claimed #$n (run:$runid). best-effort; for strict exclusivity at high fan-out use the git-ref hatch (see references/dogfood.md)."
   echo "$n"
 }
 cmd_release() {
   gh_ok || die "gh unavailable."
-  local n="${1:?release: issue number}"
+  local n="${1:?release: issue number}" runid="${2:-}"
   gh issue edit "$n" --remove-assignee @me --remove-label claimed >/dev/null 2>&1
+  gh issue comment "$n" --body "release: run:${runid:-unknown} (explicit)" >/dev/null 2>&1
   info "released #$n."
-}
-
-# ---------------------------------------------------------------------------
-# archive — snapshot a CLOSED issue to the in-repo read-only archive
-# ---------------------------------------------------------------------------
-cmd_archive() {
-  gh_ok || die "gh unavailable."
-  local n="${1:?archive: issue number}"
-  mkdir -p "$ARCHIVE_DIR"
-  local out="$ARCHIVE_DIR/ISSUE-$n.md"
-  gh issue view "$n" --json number,title,state,labels,body,closedAt \
-    --jq '"# \(.title)\n\n- issue: #\(.number)\n- state: \(.state)\n- closed: \(.closedAt)\n- labels: \([.labels[].name]|join(", "))\n\n---\n\n\(.body)"' \
-    | scrub_stream > "$out"
-  info "archived #$n -> ${out#$PLUGIN_ROOT/} (scrubbed; review before commit)."
-  echo "$out"
 }
 
 # ---------------------------------------------------------------------------
@@ -276,73 +246,6 @@ cmd_drain_inbox() {
 }
 
 # ---------------------------------------------------------------------------
-# import-archive — ONE-OFF migration of the legacy Markdown roster -> Issues.
-# Reads DOGFOOD.md rows (id|sev|area|status|title|evidence) dynamically (not
-# hard-coded), creates ONE closed issue per item with a scrubbed summary body
-# that links to the archived evidence file. Idempotent: skips an item whose
-# "[dogfood] D-NNNN:" issue already exists.
-# ---------------------------------------------------------------------------
-_problem_excerpt() {  # <evidence-file> -> the "## Problem" section, scrubbed, capped
-  awk '/^## Problem[[:space:]]*$/{f=1;next} /^## /{f=0} f' "$1" 2>/dev/null \
-    | scrub_stream | cat -s | head -c 1200
-}
-cmd_import_archive() {
-  gh_ok || die "gh unavailable; cannot import."
-  [ -f "$ROSTER" ] || die "legacy roster not found: $ROSTER"
-  local archived_rel="docs/dogfood/archive"
-  local line id sev area st title evfile created=0 skipped=0
-  # roster rows look like:  | D-0001 | sev1 | review | done | title... | docs/dogfood/D-0001.md |
-  while IFS= read -r line; do
-    case "$line" in '| D-'*) ;; *) continue;; esac
-    id="$(printf '%s' "$line"   | awk -F'|' '{gsub(/ /,"",$2); print $2}')"
-    sev="$(printf '%s' "$line"  | awk -F'|' '{gsub(/ /,"",$3); print $3}')"
-    area="$(printf '%s' "$line" | awk -F'|' '{gsub(/ /,"",$4); print $4}')"
-    st="$(printf '%s' "$line"   | awk -F'|' '{gsub(/ /,"",$5); print $5}')"
-    title="$(printf '%s' "$line" | awk -F'|' '{sub(/^ +/,"",$6); sub(/ +$/,"",$6); print $6}')"
-    [ -n "$id" ] || continue
-    local fulltitle="${id}: ${title}"
-    local dup; dup="$(find_dup "$fulltitle")"
-    if [ -n "$dup" ]; then echo "  skip   $id (already #$dup)"; skipped=$((skipped+1)); continue; fi
-    # evidence file currently at docs/dogfood/<id>.md; after migration it lives in archive/.
-    evfile="$DOGFOOD_DIR/$id.md"; [ -f "$evfile" ] || evfile="$ARCHIVE_DIR/$id.md"
-    local problem; problem="$( [ -f "$evfile" ] && _problem_excerpt "$evfile" || echo "_(evidence file missing)_")"
-    local body
-    body="$(cat <<EOF
-_Imported from the legacy Markdown dogfood backlog (pre-Issues). Original status: **${st}**._
-
-| field | value |
-|---|---|
-| id | \`${id}\` |
-| severity | ${sev} |
-| area | ${area} |
-| original status | ${st} |
-
-## Problem (excerpt)
-${problem}
-
----
-Full evidence, repro & resolution (verbatim historical record):
-\`farnsworth-loop/${archived_rel}/${id}.md\`
-EOF
-)"
-    # labels: marker + sev + area:<area> (+ wontfix when applicable)
-    local labelargs=(--label "$MARKER" --label "$sev" --label "area:$area")
-    [ "$st" = "wontfix" ] && labelargs+=(--label "wontfix")
-    local url; url="$(gh issue create --title "${TITLE_PREFIX}${fulltitle}" "${labelargs[@]}" --body "$body" 2>&1)" \
-      || { echo "  FAIL   $id: $url"; continue; }
-    local num="${url##*/}"
-    if [ "$st" = "wontfix" ]; then
-      gh issue close "$num" --reason "not planned" --comment "Imported as wontfix; see archived evidence." >/dev/null 2>&1
-    else
-      gh issue close "$num" --reason completed --comment "Resolved before the migration to Issues; see archived evidence." >/dev/null 2>&1
-    fi
-    echo "  created #$num  $id ($sev/$area/$st)"
-    created=$((created+1))
-  done < "$ROSTER"
-  info "import-archive: $created created, $skipped skipped."
-}
-
-# ---------------------------------------------------------------------------
 main() {
   local cmd="${1:-}"; shift || true
   case "$cmd" in
@@ -352,9 +255,7 @@ main() {
     next)            cmd_next "$@";;
     claim)           cmd_claim "$@";;
     release)         cmd_release "$@";;
-    archive)         cmd_archive "$@";;
     drain-inbox)     cmd_drain_inbox "$@";;
-    import-archive)  cmd_import_archive "$@";;
     ""|-h|--help|help)
       sed -n '2,40p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//';;
     *) die "unknown subcommand '$cmd' (try: help)";;

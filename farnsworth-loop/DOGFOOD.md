@@ -6,8 +6,9 @@ This file is a stub kept as a discoverable pointer; it is no longer the roster.
 - **Live backlog:** `gh issue list --label dogfood --state all` (or the link above).
 - **File / claim / work an item:** `farnsworth-loop/bin/fl-issue.sh` (see below).
 - **Convention + flow:** [`skills/farnsworth-loop/references/dogfood.md`](skills/farnsworth-loop/references/dogfood.md).
-- **Historical items (legacy `D-NNNN`):** read-only under [`docs/dogfood/archive/`](docs/dogfood/archive/);
-  each was also imported as a closed `[dogfood] D-NNNN:` issue.
+- **Historical items (legacy `D-NNNN`):** imported as **closed** `[dogfood] D-NNNN:` issues, each
+  carrying the full original evidence/repro/resolution verbatim in its body (search the `dogfood`
+  label). The old in-repo `docs/dogfood/archive/` was removed — Issues are the sole record.
 
 ```bash
 bin/fl-issue.sh bootstrap                 # (once) create the dogfood label scheme
@@ -18,5 +19,6 @@ bin/fl-issue.sh claim <N> <run-id>         # best-effort claim (see convention d
 ```
 
 > Migrated from the Markdown roster via the `@@FL` two-pass tournament
-> `fl-dogfood-vs-issues-20260615-050637` (recommendation: HYBRID — Issues for live state,
-> in-repo archive + committed inbox for durability). To roll back: `git revert` the migration PR.
+> `fl-dogfood-vs-issues-20260615-050637` (HYBRID design; the in-repo archive it proposed was dropped
+> by choice — Issues are the sole record, with a committed inbox for offline durability). To roll
+> back: `git revert` the migration PR.

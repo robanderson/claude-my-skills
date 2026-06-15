@@ -3,28 +3,29 @@
 The dogfood backlog records problems (and feature-requests) we hit while running `@@FL`
 tournaments, so they survive the **gitignored** `.runs/` directory and get triaged/fixed later.
 
-**The live backlog is GitHub Issues**, labelled `dogfood`. All forge access is confined to one
-helper, `bin/fl-issue.sh` (plugin-root `bin/`, beside `fl-git.sh`), so the tournament engine
-(`workflows/tournament.mjs`) stays forge-agnostic. The in-repo `docs/dogfood/archive/` keeps a
-read-only, greppable historical record; it is **not** a second live backlog.
+**The live backlog is GitHub Issues**, labelled `dogfood` — the **single record** (issues are not
+gitignored, so they are durable). All forge access is confined to one helper, `bin/fl-issue.sh`
+(plugin-root `bin/`, beside `fl-git.sh`), so the tournament engine (`workflows/tournament.mjs`) stays
+forge-agnostic. There is **no in-repo backlog or archive**; the only on-disk dogfood state is the
+transient committed **inbox** used when `gh` is unreachable.
 
-> **Why Issues (HYBRID), not pure Markdown and not pure Issues** — Issues add dedup, search,
-> `Closes #N` PR cross-linking, labels, and a triage UI, and they are not gitignored. But the
-> GitHub API has **no compare-and-swap**, so a label/assignee "claim" is best-effort, not a mutex
-> (see *Claiming*). And a headless/offline run may have no `gh`. So: Issues for live state; a
-> committed offline **inbox** + a committed **archive** for durability; a git-ref **escape hatch**
-> for strict exclusivity. Designed via an `@@FL` two-pass tournament (run
-> `fl-dogfood-vs-issues-20260615-050637`).
+> **Why Issues** — they add dedup, search, `Closes #N` PR cross-linking, labels, and a triage UI,
+> and they are not gitignored. The cost, accepted deliberately: the backlog no longer travels with a
+> clone (you need `gh`/network to read it), and the GitHub API has **no compare-and-swap**, so a
+> claim is best-effort, not a mutex (see *Claiming*). Mitigations: a committed offline **inbox** so a
+> headless/no-`gh` run never loses a finding, and a git-ref **escape hatch** for strict exclusivity.
+> Designed via an `@@FL` two-pass tournament (run `fl-dogfood-vs-issues-20260615-050637`); the
+> original design kept an in-repo archive, dropped here by choice in favour of Issues-as-sole-record.
 
 ## Where things live
 
 | Thing | Location |
 |---|---|
 | Live backlog (open/claimed/closed, sev/area) | GitHub Issues, label `dogfood` |
-| The capability (file / claim / next / archive) | `farnsworth-loop/bin/fl-issue.sh` |
+| The capability (bootstrap / file / next / claim / drain-inbox) | `farnsworth-loop/bin/fl-issue.sh` |
 | Issue form (structural evidence enforcement) | `.github/ISSUE_TEMPLATE/dogfood.yml` |
 | This convention | `farnsworth-loop/skills/farnsworth-loop/references/dogfood.md` |
-| Historical evidence (read-only) | `farnsworth-loop/docs/dogfood/archive/D-NNNN.md` |
+| Historical evidence (legacy `D-NNNN`) | the **closed** `dogfood` issues (full evidence in each body) |
 | Offline drafts (committed, transient) | `farnsworth-loop/docs/dogfood/inbox/` |
 
 ## Label scheme
@@ -67,8 +68,7 @@ enforced structurally by the form's `required` field + the helper's empty/placeh
 2. **Claim** it: `bin/fl-issue.sh claim <N> <run-id>` (best-effort — see below).
 3. **Fix** on a feature branch `rob/dogfood-<N>` (honours the global `rob/` prefix rule).
 4. **Open one PR** with `Closes #<N>` in the body → merging auto-closes the issue and cross-links
-   the PR. No manual roster edit.
-5. On close, optionally snapshot to the archive: `bin/fl-issue.sh archive <N>`.
+   the PR. No manual roster edit. The closed issue + its PR are the permanent record.
 
 ## Claiming (best-effort, NOT a mutex)
 
@@ -109,16 +109,18 @@ failure, `fl-issue.sh new` **degrades to a committed draft** under `docs/dogfood
 ## Historical items (legacy `D-NNNN` ids)
 
 Before the migration, items were rostered in `farnsworth-loop/DOGFOOD.md` with one evidence file per
-item. Those files are preserved **verbatim** under `docs/dogfood/archive/D-NNNN.md` (the unblinding
-they contain *is* the documented finding for several of them, and they were already public). Each was
-imported as a **closed** GitHub issue titled `[dogfood] D-NNNN: …`. Code comments that reference
-`(dogfood D-NNNN)` point at those archive files. New items use issue numbers, not `D-NNNN` ids.
+item under `docs/dogfood/`. Those were imported as **closed** GitHub issues titled `[dogfood] D-NNNN: …`,
+each carrying the **full original evidence/repro/resolution verbatim** in its body, and the in-repo
+files were removed — the closed issues are the sole record now. Code comments that reference
+`(dogfood D-NNNN)` map to those closed issues (search the title `D-NNNN`). New items use issue
+numbers, not `D-NNNN` ids.
 
 ## Rollback
 
 The migration is one PR: `git revert <merge-sha>` restores `DOGFOOD.md`, the README, and the
-in-place evidence files, and removes the helper/form. Imported issues are harmless (closed,
-labelled `dogfood`); delete them with
-`gh issue list --label dogfood --state closed --json number --jq '.[].number' | xargs -I{} gh issue delete {} --yes`
-if a full reversal is wanted. Because the archive preserved every evidence file, no information is
-lost either direction.
+in-place `docs/dogfood/D-NNNN.md` evidence files (which the migration deleted), and removes the
+helper/form. The imported closed issues are harmless to leave (closed, labelled `dogfood`); delete
+them with
+`gh issue list --label dogfood --state all --json number --jq '.[].number' | xargs -I{} gh issue delete {} --yes`
+if a full reversal is wanted. No information is lost either direction — the reverted commit restores
+the verbatim evidence files, and (until deleted) the closed issues hold the same evidence.
