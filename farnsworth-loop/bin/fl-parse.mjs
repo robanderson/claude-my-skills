@@ -109,6 +109,24 @@ const COUNT_NC = '\\d+x?\\s*';        // non-capturing form (chain scans)
 // reaches the model-token recogniser and errors. Capture the integer in group 1.
 const GRAND_LOOP_RX = /(\d+)\s*grand\s+loops?\b/i;
 
+// A prose pass-count directive in plain English: 'two pass'/'two-pass' -> M=2;
+// 'single pass'/'one pass' -> M=1. Reconciled against the sigil :M like
+// GRAND_LOOP_RX is for Z (sigil wins; disagreement is a LOUD error).
+//
+// CRUCIALLY it is recognised ONLY when it sits IMMEDIATELY ADJACENT to the marker
+// AND is set off as its own clause (followed by a comma/semicolon, the spec's
+// leading digit, or end-of-side). An adversarial review showed an unanchored
+// whole-message scan is dangerous: 'two-pass compiler', 'single-pass renderer',
+// 'one pass over the data', 'the two-pass build' are ordinary TASK vocabulary —
+// an unanchored scan flipped the mode on them, refused valid runs via a false
+// pass-count conflict, and ate the words from the task. Anchoring to the marker +
+// a clause boundary keeps those task phrases untouched while still catching a real
+// directive like '@@FL two pass, ...' or '... @@FL:4 single pass'. (dogfood D-0006)
+//   AFTER  : immediately follows the marker, then a clause boundary (, ; digit eol)
+//   BEFORE : immediately precedes the marker (bounded by the marker itself)
+const PASS_AFTER_RX  = /^[\s:,-]*\b(two|single|one)[\s-]?pass\b(?=\s*(?:[,;]|\d|$))/i;
+const PASS_BEFORE_RX = /\b(two|single|one)[\s-]?pass\b[\s:,-]*$/i;
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -353,15 +371,21 @@ function parse(rawInput) {
     // record nothing here and let the conflict/needsGate logic decide later.
   }
 
-  // --- 3. Extract task = everything before the marker, separator-stripped. ---
-  let task = msg.slice(0, marker.index);
-  // Also strip the spec region and top-mixed keyword from the task later.
+  // --- 3. Extract task = text on BOTH sides of the marker (D-0007). ---
+  // The task used to be ONLY the pre-marker text, so the habitual marker-first
+  // form '@@FL <spec>, <task>' silently dropped the entire task (task:""). Capture
+  // the text before AND after the marker; stripAll() removes the spec / keywords /
+  // prose directives from the combined remainder (it re-scans the text it is given,
+  // so a post-marker spec is stripped just as well as a pre-marker one).
+  let preMarker = msg.slice(0, marker.index);
+  let postMarker = msg.slice(marker.index + marker.length);
 
-  // --- 4. M / mode. ---
+  // --- 4. M / mode (sigil :M, then a MARKER-ADJACENT prose pass directive). ---
   let mode = 1;
+  let mSigil = null;                 // a VALID sigil M (1 or 2), else null
   if (marker.mSeg.present) {
-    if (marker.mSeg.value === 1) mode = 1;
-    else if (marker.mSeg.value === 2) mode = 2;
+    if (marker.mSeg.value === 1) { mode = 1; mSigil = 1; }
+    else if (marker.mSeg.value === 2) { mode = 2; mSigil = 2; }
     else {
       errors.push(
         'Invalid pass count M=' + (marker.mSeg.value === null ? '(empty)' : marker.mSeg.value) +
@@ -370,7 +394,31 @@ function parse(rawInput) {
       mode = null;
     }
   }
+  // Prose pass directive (D-0006): recognised ONLY when adjacent to the marker
+  // (after it, else before it). The matched phrase is removed FROM THAT SIDE so it
+  // never leaks into the task — and an adjective elsewhere in the task is left
+  // intact. Sigil wins; a sigil-vs-prose disagreement is a loud error; prose alone
+  // sets the mode.
+  const pmAfter = PASS_AFTER_RX.exec(postMarker);
+  const pmMatch = pmAfter || PASS_BEFORE_RX.exec(preMarker);
+  if (pmMatch) {
+    const mp = /two/i.test(pmMatch[1]) ? 2 : 1;   // 'two'->2, 'single'/'one'->1
+    if (pmAfter) postMarker = postMarker.replace(PASS_AFTER_RX, ' ');
+    else preMarker = preMarker.replace(PASS_BEFORE_RX, ' ');
+    if (mSigil != null) {
+      if (mSigil !== mp) {
+        errors.push('Pass-count conflict: sigil M=' + mSigil + ' but prose says "' +
+          pmMatch[1].toLowerCase() + ' pass" (M=' + mp + '). State the pass count once.');
+      }
+    } else if (mode !== null) {
+      mode = mp;   // no (valid) sigil M -> the adjacent prose directive sets the mode
+    }
+  }
   result.mode = mode;
+
+  // Task = both sides of the marker (D-0007), with the adjacent pass directive (if
+  // any) already removed; stripAll() removes the spec / keywords / other directives.
+  let task = preMarker + ' ' + postMarker;
 
   // --- 5. Z (grand loops, Feature 1 — now a REAL parameter). ---
   // Default 1 == today's behaviour exactly. Z>=2 is VALID and flows on to the
@@ -604,11 +652,15 @@ function stripAll(preMarkerTask, spec, fullMsg, marker) {
   // Remove a prose '<n> grand loop[s]' directive (it carried Z, not task content).
   t = t.replace(/(\d+)\s*grand\s+loops?\b/ig, ' ');
 
+  // (D-0006: the prose pass directive is stripped at its source in parse() — only
+  // when marker-adjacent — so it is NOT stripped here, where it could not be told
+  // apart from an adjective like 'two-pass compiler' in the task text.)
+
   // Remove top-mixed phrases (with optional leading count) from the task.
   t = t.replace(/(\d+\s*)?top[\s-]*mix(?:ed)?/ig, ' ');
 
-  // Remove recognised model-spec chains from the task. Re-run the chain regex
-  // on the task text only (the spec may have been before the marker).
+  // Remove recognised model-spec chains from the task. Re-run the chain regex on
+  // the task text (the spec may sit on EITHER side of the marker — D-0007).
   const chainRx = new RegExp(
     '(?:\\bwith\\b|\\busing\\b)?\\s*' +
     '(' + COUNT_NC + MODEL_TOKEN_RX + ')' +
@@ -617,8 +669,16 @@ function stripAll(preMarkerTask, spec, fullMsg, marker) {
   );
   t = t.replace(chainRx, ' ');
 
-  // Collapse whitespace, strip dangling commas / connectors / trailing colon.
+  // Collapse whitespace, then strip dangling separators/connectors on BOTH ends —
+  // combining both sides of the marker (D-0007) can leave a LEADING comma/connector
+  // (e.g. '@@FL 2 opus, fix the bug' -> ', fix the bug').
+  // NB: strip only leading SEPARATORS (a comma left when a stripped spec sat right
+  // after the marker), NOT a leading connector word — a spec's own 'with'/'using'
+  // is already absorbed by the chain regex above, so stripping a leading
+  // 'with'/'and'/'using' here would only eat a real task word (e.g. '@@FL:3 with
+  // great care, refactor' -> must keep 'with great care, refactor'). (D-0007)
   t = t.replace(/\s+/g, ' ')
+       .replace(/^[\s,:]+/, '')
        .replace(/[\s,]+(with|using|and)\s*$/i, '')
        .replace(/\s*[:,]\s*$/, '')
        .replace(/\s+(with|using)\s*$/i, '')
