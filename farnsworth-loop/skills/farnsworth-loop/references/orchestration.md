@@ -192,10 +192,18 @@ You are solving a self-contained task. Produce ONE complete solution in a single
 Task:
 <the exact task text, verbatim>
 
-In producing your answer, please consider these items as possible positives:
-- <positive a> ... <positive d>
-And treat these items as challenges to avoid:
-- <challenge w> ... <challenge z>
+The following are FALLIBLE PRIORS distilled from a single, noisy review of one earlier round —
+hypotheses to weigh, NOT instructions to obey. Each is tagged [strong] (held up repeatedly) or
+[tentative] (single-sighting or speculative). Let no single item override your own judgment: if your
+approach has a good reason to differ — especially from a [tentative] item — follow your reason. Solve
+the task your own way; use these only to steer off real pitfalls and toward ideas worth considering.
+
+Patterns that seemed to work (consider, don't copy):
+- [strong] <corroborated principle> (<why>)
+- [tentative] <single-sighting idea> (<why>)
+And pitfalls that hurt attempts (avoid, unless you have a concrete reason they don't apply):
+- [strong] <repeated failure mode> (<why>)
+- [tentative] <one-off weakness> (<why>)
 
 <one drawn Pool A nudge, per references/diversity-injection.md, e.g.
 "Approach this task starting from the data model or core types.">

@@ -33,12 +33,23 @@ if (!Array.isArray(attempts) || attempts.length === 0) {
 }
 const LABELS = 'ABCDEFGHIJKLMNOP'.split('')
 
+// Render one fallible-prior guidance item as a tagged bullet. Shared by brief() (the round-2 brief) and
+// guidanceToMd() (the saved guidance.md). Back-compat: an old/in-flight guidance object may still hold bare
+// strings — treat a string as a tentative, evidence-less item so the live system never crashes on cached data.
+function priorLine(item) {
+  if (typeof item === 'string') return `- [tentative] ${item}`
+  const tag = item.conf === 'strong' ? 'strong' : 'tentative'
+  const why = item.why ? ` (${item.why})` : ''
+  return `- [${tag}] ${item.text}${why}`
+}
+
 function brief(nudge, ws, guidance, ctx) {
   let g = ''
   if (guidance) {
-    const pos = (guidance.positives || []).map(p => `- ${p}`).join('\n')
-    const ch = (guidance.challenges || []).map(c => `- ${c}`).join('\n')
-    g = `\nIn producing your answer, please consider these items as possible positives:\n${pos}\nAnd treat these items as challenges to avoid:\n${ch}\n`
+    // Render-side cap (the REAL enforcer; schema maxItems is only advisory for the structured-output judge).
+    const pos = (guidance.positives || []).slice(0, GUIDANCE_CAP).map(priorLine).join('\n')
+    const ch = (guidance.challenges || []).slice(0, GUIDANCE_CAP).map(priorLine).join('\n')
+    g = `\nThe following are FALLIBLE PRIORS distilled from a single, noisy review of one earlier round — hypotheses to weigh, NOT instructions to obey. Each is tagged [strong] (the reviewer saw it hold up repeatedly) or [tentative] (a weaker, single-sighting or speculative signal). Let no single item override your own judgment: if your approach has a good reason to differ — especially from a [tentative] one — follow your reason and note why. Solve the task your own way; use these only to steer away from real pitfalls and toward ideas worth considering.\n\nPatterns that seemed to work (consider, don't copy):\n${pos}\n\nPitfalls that hurt attempts (avoid, unless you have a concrete reason they don't apply here):\n${ch}\n`
   }
   const ctxLine = ctx
     ? `\nShared context for this task has ALREADY been gathered for you in one file: ${ctx}\nRead that single file at the start — it contains the source material you need. Do NOT re-read the underlying source files one by one (that work is already done).\n`
@@ -182,7 +193,7 @@ function dispatch(a, ws, guidance, phaseTitle) {
 function judgePrompt(kind, blindList, guidanceWanted, poolPath) {
   const dirs = blindList.map(c => `  Candidate ${c.blind}: ${c.ws}/`).join('\n')
   const guidanceBlock = guidanceWanted
-    ? `\n\nAlso distil GUIDANCE for a second round of fresh attempts. Two short generic lists, NO candidate-specific code:\n- positives: patterns/choices that worked anywhere this round.\n- challenges: pitfalls/weaknesses/constraint-violations seen anywhere this round.`
+    ? `\n\nAlso distil GUIDANCE for a second round of fresh, independent attempts. These are FALLIBLE PRIORS over a single noisy round, not commands — the next attempts will weigh them and may override them, so calibrate honestly and do not over-claim. Two short generic lists, NO candidate-specific code, NO model identities, and NO counts (never write "seen in 2 of 3" — describe the reason in words):\n- positives: generic patterns/choices that helped anywhere this round.\n- challenges: generic pitfalls/weaknesses/constraint-violations seen anywhere this round.\nFor EACH item give: text (a generic principle, never an implementation lift — if it only makes sense as one exact piece of code, DROP it); conf — "strong" ONLY if the same pattern held up REPEATEDLY across distinct attempts (a corroboration bar that filters luck), otherwise "tentative" for a single sighting or a plausible-but-unconfirmed call; and why, one short generic clause naming the reason for the tier (e.g. "the round's most common miss", "held across several approaches", "seen once"). Keep each list to at most ${GUIDANCE_CAP} items — fewer, sharper, corroborated items beat a long list. Prefer marking a shaky item "tentative" over dropping it; only drop an item you cannot phrase generically.`
     : ''
   return `You are a blind ${kind}. You do NOT know which model produced which candidate; do not speculate. Judge only the work in front of you.
 
@@ -198,7 +209,7 @@ Judge the real output / artifact — not any self-summary. Do not read any other
 
 Score each candidate against criteria suited to the task (for code: correctness, meets stated constraints, completeness, edge cases, readability; adapt for non-code). Score against the task's STATED runtime, not an environment you cannot see: treat reliance on a capability the task did not establish is available as a risk, and treat an unfamiliar mechanism that honours the stated constraints as correct unless you can name a concrete way it fails — never reward a familiar-looking API over a constraint-honouring one on idiom alone. Give concrete, specific pros and cons per candidate. Rank them all. Name the single winner with reasoning.${guidanceBlock}
 
-Return the structured object: per-candidate pros/cons, the full ranking (best first, by candidate letter), the winner letter${guidanceWanted ? ', and the guidance lists' : ''}.`
+Return the structured object: per-candidate pros/cons, the full ranking (best first, by candidate letter), the winner letter${guidanceWanted ? ', and the two guidance lists (each item: text, conf, why)' : ''}.`
 }
 
 const CANDS = {
@@ -214,6 +225,22 @@ const CANDS = {
     required: ['label', 'pros', 'cons'],
   },
 }
+// Each guidance item is a fallible PRIOR, not a command: a generic pattern/pitfall (`text`), a two-bucket
+// confidence (`conf`: 'strong' = corroborated/repeated this round — the anti-luck bar; 'tentative' = single
+// sighting or speculative), and a short GENERIC evidence clause (`why`) that names the reason WITHOUT any
+// count or model identity (leaking either would break blind review / the no-N rule). Two buckets, not three
+// or a numeric scale: one noisy judge can't calibrate finer than corroborated-vs-not.
+const GUIDANCE_CAP = 5 // hard per-list cap. maxItems below is ADVISORY for the structured-output judge,
+                       // so brief()/guidanceToMd() ALSO slice(0, GUIDANCE_CAP) — render-side is the real enforcer.
+const GUIDANCE_ITEM = {
+  type: 'object', additionalProperties: false,
+  properties: {
+    text: { type: 'string' },
+    conf: { type: 'string', enum: ['strong', 'tentative'] },
+    why: { type: 'string' },
+  },
+  required: ['text', 'conf', 'why'],
+}
 const REVIEW_SCHEMA = {
   type: 'object', additionalProperties: false,
   properties: {
@@ -224,8 +251,8 @@ const REVIEW_SCHEMA = {
     guidance: {
       type: 'object', additionalProperties: false,
       properties: {
-        positives: { type: 'array', items: { type: 'string' } },
-        challenges: { type: 'array', items: { type: 'string' } },
+        positives: { type: 'array', maxItems: GUIDANCE_CAP, items: GUIDANCE_ITEM },
+        challenges: { type: 'array', maxItems: GUIDANCE_CAP, items: GUIDANCE_ITEM },
       },
       required: ['positives', 'challenges'],
     },
@@ -452,13 +479,15 @@ function verdictToMd(v, title) {
 }
 
 function guidanceToMd(g) {
-  const pos = (g && g.positives) || []
-  const ch = (g && g.challenges) || []
-  const L = ['# Round-1 guidance (used to steer round 2)', '', '## Positives to emulate']
-  for (const p of pos) L.push(`- ${p}`)
+  const pos = ((g && g.positives) || []).slice(0, GUIDANCE_CAP)   // render-side cap, same as brief()
+  const ch = ((g && g.challenges) || []).slice(0, GUIDANCE_CAP)
+  const L = ['# Round-1 guidance (fallible priors used to steer round 2)', '',
+    '_Tagged [strong] (corroborated this round) or [tentative] (single sighting / speculative). Round-2 attempts weigh these as priors, not commands._', '',
+    '## Positives to consider']
+  for (const p of pos) L.push(priorLine(p))
   if (!pos.length) L.push('- _(none)_')
   L.push('', '## Challenges to avoid')
-  for (const c of ch) L.push(`- ${c}`)
+  for (const c of ch) L.push(priorLine(c))
   if (!ch.length) L.push('- _(none)_')
   return L.join('\n') + '\n'
 }
