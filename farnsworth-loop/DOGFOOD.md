@@ -1,0 +1,23 @@
+# Farnsworth Loop — Dogfood Backlog (roster)
+
+Issues discovered while running `@@FL` tournaments, kept so they survive the **gitignored**
+`.runs/` directory and can be triaged/fixed later. This file is the **roster** (index + status);
+full evidence/repro/resolution for each item lives in `docs/dogfood/<id>.md`.
+
+Every item must be triageable with its originating run directory **deleted** — so each evidence
+file pastes a **verbatim excerpt** of the offending verdict/guidance. Run-ids here are provenance
+breadcrumbs, **not** links.
+
+Status legend: `open` · `[in-progress] @who <ISO-UTC> run:<run-id>` (claimed) · `done` · `wontfix`.
+Claiming is a **git push race**, not an in-place edit — see [`docs/dogfood/README.md`](docs/dogfood/README.md).
+
+Sort: `open` first, then by severity (`sev1` highest), newest IDs at the bottom of their group.
+Append new items; never renumber.
+
+| id     | sev  | area    | status | title                                                                            | evidence                 |
+|--------|------|---------|--------|----------------------------------------------------------------------------------|--------------------------|
+| D-0001 | sev1 | review  | open   | Blind Opus judge assumes `node:fs` exists; ranks fs-plans over correct haiku+Bash | docs/dogfood/D-0001.md   |
+| D-0002 | sev2 | infra   | open   | Round-1 `verdict`/`guidance` silently not written on large two-pass runs         | docs/dogfood/D-0002.md   |
+| D-0003 | sev3 | parse   | open   | `fl-parse.mjs` mis-reads prose `1 grand loop` and `2x opus` shorthand             | docs/dogfood/D-0003.md   |
+
+<!-- Add new rows above this line. Allocate id = (highest D-NNNN) + 1; create docs/dogfood/D-NNNN.md first. -->
