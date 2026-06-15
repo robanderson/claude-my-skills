@@ -50,20 +50,31 @@ Read across **all** candidates, winners and losers alike, and produce two short 
 ```
 ## Guidance for round 2
 
-Positives to consider:
-- <a pattern or choice that worked well anywhere in round 1>
-- <another>
-- <another>
-- <another>
+These are FALLIBLE PRIORS over a single noisy round, for a second set of fresh, independent attempts that
+will WEIGH them and may override them — not commands. Calibrate honestly; do not over-claim. Each item is a
+generic principle (never an implementation lift), a confidence tag, and a one-line reason. Use exactly TWO
+confidence levels:
+- strong  — the SAME pattern held up REPEATEDLY across distinct attempts (this repetition bar is what
+            separates real signal from a single lucky/noisy result; if it happened once, it is NOT strong).
+- tentative — a single sighting, or a plausible call you could not corroborate. Prefer tagging a shaky
+            item tentative over dropping it, so a useful-but-uncertain idea still reaches round 2.
 
-Challenges to avoid:
-- <a pitfall, bug, or weakness seen anywhere in round 1>
-- <another>
-- <another>
-- <another>
+The reason note must be GENERIC: name WHY it earned its tier in words ("the round's most common miss",
+"held across several approaches", "seen once"). NEVER write a count ("seen in 2 of 3"), and NEVER name or
+hint at a model — both would break the blind review.
+
+Positives to consider (at most 5):
+- [strong] <a principle that helped, corroborated across attempts> — <why>
+- [tentative] <a plausible but single-sighting idea> — <why>
+...
+
+Challenges to avoid (at most 5):
+- [strong] <a failure mode seen repeatedly> — <why>
+- [tentative] <a one-off weakness worth flagging> — <why>
+...
 ```
 
-Aim for roughly three to six items per list: enough to be useful, few enough to stay sharp. Good positives describe a principle ("validate and normalise user input before using it"), not an implementation lift ("copy Candidate C's input loop"). Good challenges name a concrete failure mode to avoid ("do not let a repeated guess decrement the remaining lives").
+Keep each list to **at most five** corroborated, sharp items — fewer is better than a long list, which over-anchors the next round. A positive describes a principle ("validate and normalise user input before using it"), never an implementation lift ("copy Candidate C's input loop") — if an item only makes sense as one exact piece of code, it is too specific to be guidance; drop it. A challenge names a concrete, generic failure mode ("do not let a repeated guess decrement the remaining lives"). Remember the next round's attempts are independent and differently-minded: your job is to **raise the floor** (steer them off real pitfalls, surface genuinely good ideas), not to make them all converge on one blessed approach — so reserve `strong` for what truly earned it.
 
 ## Phase 5: final ranker (two pass only)
 
