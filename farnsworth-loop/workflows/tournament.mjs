@@ -259,6 +259,27 @@ const STAGE_SCHEMA = {
   required: ['results'],
 }
 
+// D-0004 FIX — PURE, drift-proof provenance-gate builder.
+// Emits the shell snippet that sets P (the provenance flag the `D>0 && P==1` pool gate reads).
+//   - log:        the engine log filename for this dispatch ('' for native Anthropic) — selects the path.
+//   - tok:        the provider provenance token (GLM/LOCAL/CODEX/MINIMAX), '' for native.
+//   - lp:         the SHELL-ESCAPED path to the log file (q(`${ws}/${log}`)).
+//   - carriedOver: true ONLY for the two-pass round-1 winner re-staged into the final pool.
+//
+// Decision (the single behavioural delta of this fix):
+//   * native (no log)                -> `P=1` (UNCHANGED; native has no provenance contract).
+//   * carried-over runner candidate  -> `P=1` (NEW; it ALREADY passed provenance in round 1, but its
+//                                       engine log was stripped during round-1 staging, so re-grepping a
+//                                       deliberately-stripped dir always yields P=0 — the D-0004 bug).
+//   * normal runner candidate (log)  -> the line-anchored success-contract grep (UNCHANGED, byte-for-byte).
+// The deliverable (`D>0`) requirement is NOT in here — it is enforced separately at the gate, so a
+// carried-over candidate with an EMPTY staged dir is still excluded.
+function provCheckShell(log, tok, lp, carriedOver) {
+  if (!log) return `P=1`              // native Anthropic: no provenance log, unchanged
+  if (carriedOver) return `P=1`       // already validated in round 1; do NOT re-grep the stripped dir
+  return `if [ -f ${lp} ]; then if grep -q '^FARNSWORTH-${tok}-PROVENANCE endpoint=' ${lp} && grep -q '^FARNSWORTH-${tok}-DONE exit=0' ${lp} && ! grep -q '^FARNSWORTH-${tok}-\\(TIMEOUT\\|ERROR\\)' ${lp}; then P=1; else P=0; fi; else P=0; fi`
+}
+
 // Persist-verification schema: the write-agent reports, per FINAL target path, the byte count
 // (`wc -c`) of the file it wrote — NOT free text. We decide success from `bytes > 0` per path, so a
 // silently-skipped write (no file → reported as bytes:0/absent) can never read as success (#D-0002).
@@ -303,9 +324,11 @@ async function stageAndValidate(list, reviewDir, phaseTitle) {
     // FAIL CLOSED (#2): the PROVENANCE line is written UNCONDITIONALLY at runner startup, so a missing log
     // here means the runner never ran (native-solve spoof / refusal) → P=0. Native attempts (no runner) → P=1.
     const tok = c.dispatch === 'glm' ? 'GLM' : c.dispatch === 'local' ? 'LOCAL' : c.dispatch === 'codex' ? 'CODEX' : c.dispatch === 'minimax' ? 'MINIMAX' : ''
-    const provChk = log
-      ? `if [ -f ${lp} ]; then if grep -q '^FARNSWORTH-${tok}-PROVENANCE endpoint=' ${lp} && grep -q '^FARNSWORTH-${tok}-DONE exit=0' ${lp} && ! grep -q '^FARNSWORTH-${tok}-\\(TIMEOUT\\|ERROR\\)' ${lp}; then P=1; else P=0; fi; else P=0; fi`
-      : `P=1`
+    // D-0004: a carried-over round-1 winner was ALREADY provenance-validated in round 1, but its engine log
+    // was stripped during round-1 staging — so re-grepping its stripped staging dir always yields P=0 and the
+    // winner is wrongly dropped. provCheckShell skips ONLY the provenance grep for a carryover (P=1); the
+    // deliverable requirement below (`D>0`) is still enforced, so an empty carryover is still excluded.
+    const provChk = provCheckShell(log, tok, lp, !!c.carriedOver)
     return `mkdir -p ${q(dest)}; cp -R ${q(c.ws)}/. ${q(dest)}/ 2>/dev/null; ` +
            `rm -f ${q(dest)}/_brief.txt ${q(dest)}/_glm_run.log ${q(dest)}/_local_run.log ${q(dest)}/_codex_run.log ${q(dest)}/_codex_last.txt ${q(dest)}/_minimax_run.log; ` +
            `D=$(find ${q(dest)} -type f 2>/dev/null | grep -c .); ${provChk}; ` +
@@ -550,9 +573,14 @@ const r2 = (await parallel(attempts.map(a => () => dispatch(a, `${runDir}/round-
 
 // final pool = round-2 attempts + the carried-over round-1 winner. Staging erases the round path,
 // so the judge cannot tell which finalist is the carryover.
+// D-0004: champ.ws is the round-1 STRIPPED staging dir (review-1/<blind>/) — its provenance log was
+// already deleted there. The carryover passed provenance in round 1, so mark it carriedOver:true and
+// have stageAndValidate skip ONLY the provenance grep for it (the deliverable is still required). Without
+// this flag, a runner-backed (glm/codex/minimax/local) round-1 winner would re-grep the stripped dir,
+// get P=0, and be wrongly dropped from the final pool the Opus ranker reads.
 const finalPool = [
   ...r2.map(c => ({ ws: c.ws, displayModel: c.displayModel, dispatch: c.dispatch, round: 2 })),
-  { ws: champ.ws, displayModel: champ.displayModel, dispatch: champ.dispatch, round: 1 },
+  { ws: champ.ws, displayModel: champ.displayModel, dispatch: champ.dispatch, round: 1, carriedOver: true },
 ]
 phase('Final rank')
 const stagedF = await stageAndValidate(blindLabel(finalPool, 2), `${runDir}/review-final`, 'Final rank')
