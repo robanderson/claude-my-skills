@@ -25,7 +25,11 @@
     {
       "name": "farnsworth-loop",
       "description": "Run a Farnsworth Loop tournament via the explicit marker 'farnsworth loop:N' (single pass) or 'farnsworth loop:N:2' (two pass). Same engine as best-of-n: N parallel attempts judged blind by an Opus reviewer; two pass adds a guided second round and a final blind rank against the carried-over round-one winner. Attempts can run on Anthropic models or GLM z.ai models (via the glm CLI)",
-      "source": "./farnsworth-loop"
+      "source": {
+        "source": "github",
+        "repo": "robanderson/Farnsworth-Loop",
+        "ref": "main"
+      }
     }
   ]
 }
