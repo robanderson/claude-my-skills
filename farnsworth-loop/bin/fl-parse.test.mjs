@@ -263,6 +263,67 @@ parseCase('ordinary grand noun untouched', 'redesign the grand staircase @@FL:5'
   { task: 'redesign the grand staircase', n: 5, z: 1, assignment: null }, { noErrors: true });
 
 // ===========================================================================
+// D-0006 — prose 'two pass' / 'single pass' / 'one pass' sets the mode.
+// ===========================================================================
+parseCase('D-0006 two pass -> mode 2', '@@FL two pass, 2 opus, 2 sonnet do X',
+  { task: 'do X', n: 4, mode: 2, z: 1, assignment: ['opus', 'opus', 'sonnet', 'sonnet'] }, { noErrors: true });
+parseCase('D-0006 two-pass (hyphen) -> mode 2', '@@FL two-pass, 2 opus, 2 sonnet do X',
+  { task: 'do X', n: 4, mode: 2, assignment: ['opus', 'opus', 'sonnet', 'sonnet'] }, { noErrors: true });
+parseCase('D-0006 single pass -> mode 1', 'refactor @@FL:4 single pass',
+  { task: 'refactor', n: 4, mode: 1, z: 1 }, { noErrors: true });
+parseCase('D-0006 one pass -> mode 1', 'do x @@FL:4 one pass',
+  { mode: 1 }, { noErrors: true });
+parseCase('D-0006 prose marker + two pass', 'do X farnsworth loop:4 two pass',
+  { n: 4, mode: 2 }, { noErrors: true });
+// sigil :M wins; agreeing prose is fine.
+parseCase('D-0006 sigil M=2 agrees with two pass', '@@FL:4:2 two pass, do X',
+  { task: 'do X', n: 4, mode: 2 }, { noErrors: true });
+// sigil :M vs prose DISAGREE -> loud conflict error, n nulled.
+parseCase('D-0006 sigil M vs prose conflict', '@@FL:4:2 single pass, do X',
+  { n: null }, { errorIncludes: 'Pass-count conflict' });
+// false-positive guard: 'two passes of feedback' is NOT 'two pass' -> mode stays 1.
+parseCase('D-0006 "two passes" does NOT flip mode', 'review @@FL:4 give me two passes of feedback',
+  { mode: 1, n: 4 }, { noErrors: true });
+// --- D-0006 OVER-MATCH regressions (adversarial-review catch): a hyphenated /
+// mid-task pass adjective is NOT a directive — it must not flip the mode, raise a
+// false conflict, refuse the run, or be eaten from the task. ---
+parseCase('D-0006 "two-pass compiler" task is NOT a directive', 'build a two-pass compiler @@FL:4',
+  { task: 'build a two-pass compiler', n: 4, mode: 1, z: 1 }, { noErrors: true });
+parseCase('D-0006 "two-pass build" does NOT cause a false conflict', 'replace the two-pass build with a faster one @@FL:5:1',
+  { n: 5, mode: 1 }, { noErrors: true });
+parseCase('D-0006 "single-pass renderer" task kept; sigil mode honoured', 'optimize the single-pass renderer @@FL:5:2',
+  { task: 'optimize the single-pass renderer', n: 5, mode: 2 }, { noErrors: true });
+parseCase('D-0006 mid-task "two-pass" after spec is kept', '@@FL:4:1 with 2 opus, 2 sonnet, rewrite the two-pass tokenizer',
+  { task: 'rewrite the two-pass tokenizer', n: 4, mode: 1, assignment: ['opus', 'opus', 'sonnet', 'sonnet'] }, { noErrors: true });
+// a directive immediately followed by the spec (no comma) still works (clause boundary = the digit).
+parseCase('D-0006 directive then spec digit', '@@FL two pass 2 opus, 2 sonnet, do the thing',
+  { task: 'do the thing', n: 4, mode: 2, assignment: ['opus', 'opus', 'sonnet', 'sonnet'] }, { noErrors: true });
+
+// ===========================================================================
+// D-0007 — task text after a leading @@FL marker is captured (not dropped).
+// ===========================================================================
+parseCase('D-0007 marker-first spec + task', '@@FL 2 opus, fix the parser bug',
+  { task: 'fix the parser bug', n: 2, mode: 1, z: 1, assignment: ['opus', 'opus'] }, { noErrors: true });
+parseCase('D-0007 sigil N + trailing task', '@@FL:2 do the thing',
+  { task: 'do the thing', n: 2 }, { noErrors: true });
+parseCase('D-0007 spec + task both after marker', '@@FL:4 with 2 opus and 2 sonnet, refactor the parser',
+  { task: 'refactor the parser', n: 4, assignment: ['opus', 'opus', 'sonnet', 'sonnet'] }, { noErrors: true });
+parseCase('D-0007 bare marker-first task -> needsGate, task kept', '@@FL fix the parser bug',
+  { task: 'fix the parser bug', n: null, needsGate: true }, { noErrors: true });
+// regression: pre-marker task still works.
+parseCase('D-0007 pre-marker task unchanged', 'fix the bug @@FL:2',
+  { task: 'fix the bug', n: 2 }, { noErrors: true });
+// D-0006 + D-0007 together: the original failing invocation shape.
+parseCase('D-0006+D-0007 combined', '@@FL two pass, 2 opus, 2 sonnet, build a CSV parser',
+  { task: 'build a CSV parser', n: 4, mode: 2, assignment: ['opus', 'opus', 'sonnet', 'sonnet'] }, { noErrors: true });
+// D-0007 leading-word: a task that legitimately STARTS with 'with'/'and'/'using'
+// must NOT have that word eaten (the spec's own connector is absorbed separately).
+parseCase('D-0007 leading "with" kept', '@@FL:3 with great care, refactor',
+  { task: 'with great care, refactor', n: 3 }, { noErrors: true });
+parseCase('D-0007 leading "and" kept', '@@FL:3 and then ship it',
+  { task: 'and then ship it', n: 3 }, { noErrors: true });
+
+// ===========================================================================
 // unit-level normaliser / helpers.
 // ===========================================================================
 unit('normalise opus', normaliseModel('opus') && normaliseModel('opus').model === 'opus');
