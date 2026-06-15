@@ -23,6 +23,10 @@ node ~/.claude/my-skills/farnsworth-loop/bin/fl-bench.mjs --models glm:glm-5.1,c
 
 # dry-run: print the resolved plan, make NO model calls (cheap + testable):
 node ~/.claude/my-skills/farnsworth-loop/bin/fl-bench.mjs --list --models all
+
+# heavy profile: >5k-token input context + long (>5k-token) output, for a
+# representative coding/agentic workload (slower + pricier than light):
+node ~/.claude/my-skills/farnsworth-loop/bin/fl-bench.mjs --models opus,minimax-m3 --profile heavy
 ```
 
 It is invoked like the other `bin/` tools (a plain script run with `node` /
@@ -37,7 +41,20 @@ It is invoked like the other `bin/` tools (a plain script run with `node` /
 | `<provider>:<id>`| one model, e.g. `glm:glm-5.1`, `codex:codex-high`, `local:<omlx-id>`, `anthropic:opus` |
 | `<id>`           | a bare id matched against the catalogue (`opus`, `glm-5.2`, `minimax-m3`, `codex-high`, a local id) |
 
-Other flags: `--list` (dry-run), `--timeout <secs>` (per-call backstop), `--help`.
+Other flags: `--profile light|heavy` (`--heavy`/`--light` shorthand; default
+`light`), `--list` (dry-run), `--timeout <secs>` (per-call backstop), `--help`.
+
+## Profiles (`--profile`)
+
+| Profile | Input | Output cap | Timeouts (default/local) | Use |
+|---------|-------|-----------|--------------------------|-----|
+| `light` (default) | ~200-word ask | 2048 | 240s / 600s | fast/cheap throughput smoke |
+| `heavy` | fixed **>5k-token** code context | 8192 | 600s / 1200s | representative coding/agentic load: drives **>5k-token decode** |
+
+The light cap is **2048, not a few hundred**: an extended-thinking model rejects
+a sub-1024 output cap with `400 thinking.enabled.budget_tokens: Input should be
+greater than or equal to 1024` — the bug that made `haiku` FAIL in the first
+all-models sweep (dogfood **D-0005**). The profile name is recorded on every row.
 
 ## Models covered
 
@@ -59,14 +76,18 @@ sweep continues.
 
 ## How tok/s is measured
 
-- Fixed, **identical** prompt for every model; bounded output (~256 tokens).
-  `tok/s = output_tokens / generation_wall_seconds`.
-- **Real** provider token counts:
+- Fixed, **identical** prompt per profile for every model. `tok/s =
+  output_tokens / generation_wall_seconds`.
+- **Real** provider token counts (output AND input):
   - claude-family (`anthropic`/`glm`/`minimax`): `claude -p --output-format json
     --verbose` emits a JSON **array** of stream events; we parse it and walk the
-    structure for the maximal `usage.output_tokens` (never `JSON.parse(stdout).usage`,
-    never chars/4).
-  - local: omlx `usage.completion_tokens`.
+    structure for the maximal `usage.output_tokens` and the real input size
+    (`input_tokens` + `cache_read` + `cache_creation`, so the hot call's cached
+    re-read still counts) — never `JSON.parse(stdout).usage`, never chars/4.
+    **A completed result is honoured even when the `claude` CLI exits nonzero**
+    (dogfood D-0005: glm-5.1 exited 1 with a real `output_tokens:256` that the
+    old code discarded); an `is_error` result reports the real API reason.
+  - local: omlx `usage.completion_tokens` (output) + `usage.prompt_tokens` (input).
   - codex: a real `token_count`/usage event if present; otherwise a **chars/4
     estimate** of the captured final message, flagged `estimated:true` (the only
     place estimation is used — the constraints explicitly allow it for the codex CLI).
@@ -82,8 +103,12 @@ sweep continues.
   the hosted providers it is connection/cache/route warmup, **not** a true model
   load. **"Hot"** is an immediate second identical call.
 - The `claude` CLI has **no `--max-tokens`**; output is bounded by the prompt
-  plus `CLAUDE_CODE_MAX_OUTPUT_TOKENS` — a **soft** cap for claude-family. Local
-  (raw HTTP) and codex take a hard `max_tokens`/effort where supported.
+  plus `CLAUDE_CODE_MAX_OUTPUT_TOKENS` — a **soft** cap for claude-family that
+  **must be ≥ 1024** (the thinking-budget floor), hence the 2048/8192 profile
+  caps. Local (raw HTTP) and codex take a hard `max_tokens`/effort where supported.
+- claude-family **input** tokens include Claude Code's own system prompt, so they
+  are large even on the light profile; **local** input is just the user prompt,
+  so the heavy profile's >5k-token context is what pushes local input past 5k.
 
 ## Results file — format & location
 
@@ -101,12 +126,15 @@ Each record:
 {
   "provider": "glm",
   "model": "glm-5.1",
+  "profile": "light",
   "ok": true,
   "cold_tok_s": 41.2,
   "hot_tok_s": 55.7,
   "delta_tok_s": 14.5,
   "cold_tokens": 248,
   "hot_tokens": 251,
+  "cold_input_tokens": 28907,
+  "hot_input_tokens": 28907,
   "cold_secs": 6.02,
   "hot_secs": 4.51,
   "estimated": false,
@@ -115,6 +143,10 @@ Each record:
 }
 ```
 
+- `profile` — `light` or `heavy`; never mix the two when comparing tok/s.
+- `cold_tokens`/`hot_tokens` are **output** tokens; `cold_input_tokens`/
+  `hot_input_tokens` are the real prompt size (shown as `cIn`/`cOut`/`hOut` in
+  the table). Under `--profile heavy` both input and output should exceed 5k.
 - `timestamp` — local-tz ISO-8601 with offset, so runs accumulate and stay
   chronologically readable across invocations.
 - `ok:false` rows carry the failure text in `error` (e.g. `cold: timeout after
