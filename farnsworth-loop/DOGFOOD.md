@@ -1,6 +1,7 @@
 # Farnsworth Loop — Dogfood Backlog
 
-**The live dogfood backlog has moved to GitHub Issues** (label [`dogfood`](https://github.com/robanderson/claude-my-skills/issues?q=label%3Adogfood)).
+**The live dogfood backlog has moved to GitHub Issues** (label `dogfood`; list with
+`gh issue list --label dogfood --state all`, or open the repo's Issues tab filtered by that label).
 This file is a stub kept as a discoverable pointer; it is no longer the roster.
 
 - **Live backlog:** `gh issue list --label dogfood --state all` (or the link above).

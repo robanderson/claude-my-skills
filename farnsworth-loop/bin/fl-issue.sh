@@ -24,6 +24,10 @@
 # Offline / no-gh / headless: `new` degrades to a COMMITTED inbox file under
 # docs/dogfood/inbox/ (NEVER .runs/, which is gitignored) so a finding is never
 # lost; drain-inbox files them when connectivity returns.
+#
+# Target repo: NOT hard-coded. Resolved once per run as  $GH_REPO  if set, else
+# inferred by `gh` from the current git checkout's remote. Set GH_REPO=owner/repo
+# to pin it (e.g. in a fork or a multi-remote checkout where inference is ambiguous).
 # =============================================================================
 set -uo pipefail
 
@@ -40,6 +44,22 @@ info() { echo "fl-issue: $*" >&2; }
 now()  { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
 gh_ok() { command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; }
+
+# Resolve the target repo ONCE: $GH_REPO if set (explicit override, deterministic
+# even with multiple remotes), else `gh`'s inference from the local git remote.
+# Every issue/label call is pinned to it via ghi() so a run can't straddle repos.
+FL_REPO=""
+resolve_repo() {
+  [ -n "$FL_REPO" ] && return 0
+  if [ -n "${GH_REPO:-}" ]; then
+    FL_REPO="$GH_REPO"
+  else
+    FL_REPO="$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null)"
+  fi
+  [ -n "$FL_REPO" ] || die "cannot resolve target repo — set GH_REPO=owner/repo, or run inside a checkout with a GitHub remote."
+  info "target repo: $FL_REPO"
+}
+ghi() { gh "$@" --repo "$FL_REPO"; }   # gh, pinned to the resolved repo
 
 # ---------------------------------------------------------------------------
 # Guards (pure text; NO network — unit-testable)
@@ -75,6 +95,7 @@ check_evidence() {
 # ---------------------------------------------------------------------------
 cmd_bootstrap() {
   gh_ok || die "gh not available/authenticated; cannot bootstrap labels."
+  resolve_repo
   local specs=(
     "dogfood|6f42c1|FL dogfood backlog item (found while running @@FL)"
     "sev1|b60205|wrong winners / corrupts tournament outcome"
@@ -93,10 +114,10 @@ cmd_bootstrap() {
   local spec name color desc
   for spec in "${specs[@]}"; do
     IFS='|' read -r name color desc <<<"$spec"
-    if gh label create "$name" --color "$color" --description "$desc" >/dev/null 2>&1; then
+    if ghi label create "$name" --color "$color" --description "$desc" >/dev/null 2>&1; then
       echo "  created  $name"
     else
-      gh label edit "$name" --color "$color" --description "$desc" >/dev/null 2>&1 \
+      ghi label edit "$name" --color "$color" --description "$desc" >/dev/null 2>&1 \
         && echo "  exists   $name" || echo "  SKIP     $name (label op failed)"
     fi
   done
@@ -148,7 +169,7 @@ find_dup() {  # <full-title-without-prefix> -> prints existing issue number, if 
   local want="${TITLE_PREFIX}$1" num title
   while IFS=$'\t' read -r num title; do
     [ "$title" = "$want" ] && { echo "$num"; return 0; }
-  done < <(gh issue list --state all --label "$MARKER" --limit 400 \
+  done < <(ghi issue list --state all --label "$MARKER" --limit 400 \
              --json number,title --jq '.[]|[.number,.title]|@tsv' 2>/dev/null)
   return 0
 }
@@ -170,9 +191,10 @@ cmd_new() {
   local rc; check_evidence "$EVIDENCE_FILE"; rc=$?; [ $rc -ne 0 ] && return $rc
   local body; body="$(render_body)"
   if ! gh_ok; then fallback_inbox "$TITLE" "$body"; return 0; fi
+  resolve_repo
   local dup; dup="$(find_dup "$TITLE")"
   if [ -n "$dup" ]; then info "duplicate of #$dup — not filing (comment there if new info)."; echo "$dup"; return 0; fi
-  gh issue create --title "${TITLE_PREFIX}${TITLE}" \
+  ghi issue create --title "${TITLE_PREFIX}${TITLE}" \
     --label "$MARKER" --label "$SEV" --label "area:$AREA" --body "$body"
 }
 
@@ -181,9 +203,10 @@ cmd_new() {
 # ---------------------------------------------------------------------------
 cmd_next() {
   gh_ok || die "gh unavailable."
+  resolve_repo
   local sev n
   for sev in sev1 sev2 sev3; do
-    n="$(gh issue list --state open --label "$MARKER" --label "$sev" --json number \
+    n="$(ghi issue list --state open --label "$MARKER" --label "$sev" --json number \
          --jq 'if length>0 then (min_by(.number).number) else empty end' 2>/dev/null)"
     if [ -n "$n" ]; then echo "$n"; return 0; fi
   done
@@ -199,23 +222,24 @@ cmd_next() {
 # ---------------------------------------------------------------------------
 cmd_claim() {
   gh_ok || die "gh unavailable."
+  resolve_repo
   local n="${1:?claim: issue number}" runid="${2:?claim: run-id}" me
   me="$(gh api user --jq .login 2>/dev/null)" || die "claim: cannot resolve gh user."
   # IDENTITY IS THE RUN-ID, not the gh login: @@FL workers usually share ONE gh account,
   # so assignee/login cannot disambiguate two concurrent runs. The durable `claim: run:<id>`
   # comment is the lock; the assignee + `claimed` label are just visible state.
   # 1. announce our claim (carries our run-id).
-  gh issue comment "$n" --body "claim: run:$runid by:@$me at:$(now)" >/dev/null 2>&1 \
+  ghi issue comment "$n" --body "claim: run:$runid by:@$me at:$(now)" >/dev/null 2>&1 \
     || die "claim: cannot comment on #$n."
-  gh issue edit "$n" --add-assignee @me --add-label claimed >/dev/null 2>&1
+  ghi issue edit "$n" --add-assignee @me --add-label claimed >/dev/null 2>&1
   # 2. deterministic tiebreak: the EARLIEST `claim: run:` comment wins. Livelock-free —
   #    only losers back off; once the comments exist the winning run-id is fixed.
   local winner
-  winner="$(gh issue view "$n" --json comments \
+  winner="$(ghi issue view "$n" --json comments \
     --jq '[.comments[]|select(.body|test("^claim: run:"))]|sort_by(.createdAt,.url)|.[0].body|capture("run:(?<r>[^ ]+)").r' 2>/dev/null)"
   if [ -n "$winner" ] && [ "$winner" != "$runid" ]; then
     info "lost claim on #$n: run:$winner got there first (mine run:$runid) — backing off."
-    gh issue comment "$n" --body "release: run:$runid (superseded by run:$winner)" >/dev/null 2>&1
+    ghi issue comment "$n" --body "release: run:$runid (superseded by run:$winner)" >/dev/null 2>&1
     return 2
   fi
   info "claimed #$n (run:$runid). best-effort; for strict exclusivity at high fan-out use the git-ref hatch (see references/dogfood.md)."
@@ -223,9 +247,10 @@ cmd_claim() {
 }
 cmd_release() {
   gh_ok || die "gh unavailable."
+  resolve_repo
   local n="${1:?release: issue number}" runid="${2:-}"
-  gh issue edit "$n" --remove-assignee @me --remove-label claimed >/dev/null 2>&1
-  gh issue comment "$n" --body "release: run:${runid:-unknown} (explicit)" >/dev/null 2>&1
+  ghi issue edit "$n" --remove-assignee @me --remove-label claimed >/dev/null 2>&1
+  ghi issue comment "$n" --body "release: run:${runid:-unknown} (explicit)" >/dev/null 2>&1
   info "released #$n."
 }
 
@@ -257,7 +282,7 @@ main() {
     release)         cmd_release "$@";;
     drain-inbox)     cmd_drain_inbox "$@";;
     ""|-h|--help|help)
-      sed -n '2,40p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//';;
+      sed -n '/^# ===/,/^# ===/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//';;
     *) die "unknown subcommand '$cmd' (try: help)";;
   esac
 }

@@ -28,6 +28,11 @@ transient committed **inbox** used when `gh` is unreachable.
 | Historical evidence (legacy `D-NNNN`) | the **closed** `dogfood` issues (full evidence in each body) |
 | Offline drafts (committed, transient) | `farnsworth-loop/docs/dogfood/inbox/` |
 
+**Target repo (not hard-coded).** `bin/fl-issue.sh` resolves the repo once per run: `$GH_REPO` if
+set (`owner/repo`), otherwise inferred by `gh` from the current checkout's git remote, and every
+issue/label call is pinned to it. Set `GH_REPO` to pin a target on a fork or a multi-remote checkout
+where inference is ambiguous; otherwise the backlog simply follows whatever repo you're working in.
+
 ## Label scheme
 
 - Marker: **`dogfood`** (every FL-filed item; the saved query keys off it).
