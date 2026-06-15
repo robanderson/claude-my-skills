@@ -259,7 +259,6 @@ const STAGE_SCHEMA = {
   required: ['results'],
 }
 
-<<<<<<< HEAD
 // D-0004 FIX — PURE, drift-proof provenance-gate builder.
 // Emits the shell snippet that sets P (the provenance flag the `D>0 && P==1` pool gate reads).
 //   - log:        the engine log filename for this dispatch ('' for native Anthropic) — selects the path.
@@ -279,7 +278,8 @@ function provCheckShell(log, tok, lp, carriedOver) {
   if (!log) return `P=1`              // native Anthropic: no provenance log, unchanged
   if (carriedOver) return `P=1`       // already validated in round 1; do NOT re-grep the stripped dir
   return `if [ -f ${lp} ]; then if grep -q '^FARNSWORTH-${tok}-PROVENANCE endpoint=' ${lp} && grep -q '^FARNSWORTH-${tok}-DONE exit=0' ${lp} && ! grep -q '^FARNSWORTH-${tok}-\\(TIMEOUT\\|ERROR\\)' ${lp}; then P=1; else P=0; fi; else P=0; fi`
-=======
+}
+
 // Persist-verification schema: the write-agent reports, per FINAL target path, the byte count
 // (`wc -c`) of the file it wrote — NOT free text. We decide success from `bytes > 0` per path, so a
 // silently-skipped write (no file → reported as bytes:0/absent) can never read as success (#D-0002).
@@ -296,7 +296,6 @@ const PERSIST_SCHEMA = {
     },
   },
   required: ['results'],
->>>>>>> origin/main
 }
 
 // Stage + validate + pool, all from one cheap haiku agent running a DETERMINISTIC shell script:

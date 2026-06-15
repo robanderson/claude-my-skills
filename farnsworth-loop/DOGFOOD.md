@@ -16,15 +16,9 @@ Append new items; never renumber.
 
 | id     | sev  | area    | status | title                                                                            | evidence                 |
 |--------|------|---------|--------|----------------------------------------------------------------------------------|--------------------------|
-<<<<<<< HEAD
-| D-0001 | sev1 | review  | open   | Blind Opus judge assumes `node:fs` exists; ranks fs-plans over correct haiku+Bash | docs/dogfood/D-0001.md   |
-| D-0004 | sev1 | review  | done   | Non-Anthropic round-1 winner excluded from final pool (carryover provenance re-check) | docs/dogfood/D-0004.md |
-| D-0002 | sev2 | infra   | open   | Round-1 `verdict`/`guidance` silently not written on large two-pass runs         | docs/dogfood/D-0002.md   |
-| D-0003 | sev3 | parse   | open   | `fl-parse.mjs` mis-reads prose `1 grand loop` and `2x opus` shorthand             | docs/dogfood/D-0003.md   |
-=======
 | D-0001 | sev1 | review  | done   | Blind Opus judge assumes `node:fs` exists; ranks fs-plans over correct haiku+Bash | docs/dogfood/D-0001.md   |
+| D-0004 | sev1 | review  | done   | Non-Anthropic round-1 winner excluded from final pool (carryover provenance re-check) | docs/dogfood/D-0004.md |
 | D-0002 | sev2 | infra   | done   | Round-1 `verdict`/`guidance` silently not written on large two-pass runs         | docs/dogfood/D-0002.md   |
 | D-0003 | sev3 | parse   | done   | `fl-parse.mjs` mis-reads prose `1 grand loop` and `2x opus` shorthand             | docs/dogfood/D-0003.md   |
->>>>>>> origin/main
 
 <!-- Add new rows above this line. Allocate id = (highest D-NNNN) + 1; create docs/dogfood/D-NNNN.md first. -->
