@@ -53,5 +53,9 @@ temp/
 .runs/
 **/.runs/
 
+# Farnsworth Loop fl-bench runtime results (created by bin/fl-bench.mjs)
+farnsworth-loop/.bench/
+**/.bench/
+
 # Local settings that shouldn't be shared
 .claude/settings.local.json
