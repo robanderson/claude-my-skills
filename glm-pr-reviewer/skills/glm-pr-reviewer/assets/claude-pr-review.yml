@@ -1,0 +1,157 @@
+# Claude Code PR reviewer (via GLM / Z.AI)
+# ----------------------------------------------------------------------------
+# Place this file at:
+#   Forgejo:  .forgejo/workflows/claude-pr-review.yml
+#   Gitea:    .gitea/workflows/claude-pr-review.yml
+# (identical content for both)
+#
+# One-time setup per server:
+#   1. Add an Actions secret named  ZAI_API_KEY  = your Z.AI GLM key
+#      (repo Settings -> Actions -> Secrets, or set it org/global-wide).
+#   2. Make sure Actions are enabled for the repo and a runner with the
+#      `ubuntu-latest` label is online (yours are).
+#   3. The job image must have Node + npm (catthehacker/ubuntu:act-latest does).
+#
+# What it does on every PR open/update:
+#   - pulls the PR diff via the server API
+#   - runs Claude Code headless (`claude -p`) against GLM-4.7
+#   - posts the review as a PR comment
+#   - sets a `claude-review` commit status (success/failure) AND fails the job
+#     on a FAIL verdict, so it can gate merges via branch protection.
+# ----------------------------------------------------------------------------
+
+name: Claude PR Review (GLM)
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+
+permissions:
+  contents: read
+  pull-requests: write
+  statuses: write
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    env:
+      # ---- Z.AI / GLM (Anthropic-compatible endpoint) ----
+      ANTHROPIC_BASE_URL: https://api.z.ai/api/anthropic
+      ANTHROPIC_AUTH_TOKEN: ${{ secrets.ZAI_API_KEY }}
+      # Review model. glm-5.2 = current SOTA on the coding plan. Use "glm-4.7"
+      # for the cheaper 1x workhorse tier, or "glm-5.2[1m]" for 1M context.
+      ANTHROPIC_MODEL: glm-5.2
+      ANTHROPIC_DEFAULT_OPUS_MODEL: "glm-5.2[1m]"
+      ANTHROPIC_DEFAULT_SONNET_MODEL: glm-4.7
+      ANTHROPIC_DEFAULT_HAIKU_MODEL: glm-4.5-air
+      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+      CLAUDE_CODE_AUTO_COMPACT_WINDOW: "1000000"
+      API_TIMEOUT_MS: "3000000"
+      # ---- Repo / PR context (provided by the runner) ----
+      API_URL: ${{ github.server_url }}/api/v1
+      REPO: ${{ github.repository }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      REPO_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      REVIEW_PROMPT: |
+        You are a senior software engineer doing a focused pull-request review.
+        The PR's unified diff is provided to you as input (stdin).
+
+        Review only what the diff changes, plus obvious ripple effects. Look for:
+        - Bugs / correctness issues and logic errors
+        - Security problems (injection, secrets, authz, unsafe input handling)
+        - Breaking changes to public behavior or APIs
+        - Missing or inadequate tests for new logic
+        - Clear maintainability / readability problems
+
+        Be concise and specific. Reference file paths and line numbers from the
+        diff. Do not invent issues; if the change is fine, say so plainly.
+
+        Output GitHub-flavored markdown:
+        1. A 2-4 sentence summary.
+        2. Findings grouped under **Blocker**, **Warning**, **Nit**
+           (omit any group that is empty).
+
+        Then, on the VERY LAST line, output exactly one of:
+        VERDICT: PASS
+        VERDICT: FAIL
+        Use FAIL only if there is at least one Blocker.
+    steps:
+      - name: Review pull request with Claude Code (GLM)
+        run: |
+          # Actions runs steps with `bash -e -o pipefail`. Disable errexit so our
+          # explicit RC checks and `|| echo` control flow, and the review always
+          # posts a comment + status even when Claude errors (e.g. missing key).
+          set +e
+          set -u
+
+          echo "::group::Install tooling"
+          command -v jq >/dev/null 2>&1 || (sudo apt-get update -y && sudo apt-get install -y jq)
+          npm install -g @anthropic-ai/claude-code >/dev/null 2>&1 \
+            || npm install -g @anthropic-ai/claude-code
+          echo "claude: $(claude --version 2>/dev/null || echo 'NOT FOUND')"
+          echo "::endgroup::"
+
+          echo "::group::Fetch PR diff"
+          curl -fsSL -H "Authorization: token ${REPO_TOKEN}" \
+            "${API_URL}/repos/${REPO}/pulls/${PR_NUMBER}.diff" -o pr.diff
+          # Keep the prompt within a sane size for frequent automated runs.
+          head -c 300000 pr.diff > pr.diff.trim && mv pr.diff.trim pr.diff
+          echo "diff bytes: $(wc -c < pr.diff)"
+          echo "::endgroup::"
+
+          echo "::group::Run Claude review"
+          # Z.AI occasionally returns 529 (overloaded). Retry a few times with
+          # backoff before giving up, so a brief blip doesn't fail the check.
+          ATTEMPTS=3
+          RC=1; REVIEW=""
+          for i in $(seq 1 $ATTEMPTS); do
+            echo "--- Claude attempt $i/$ATTEMPTS (model: $ANTHROPIC_MODEL) ---"
+            claude -p "$REVIEW_PROMPT" < pr.diff > claude.out 2> claude.err
+            RC=$?
+            REVIEW=$(cat claude.out)
+            if [ $RC -eq 0 ] && [ -n "$REVIEW" ]; then
+              echo "Claude succeeded on attempt $i"
+              break
+            fi
+            echo "Attempt $i failed (rc=$RC):"
+            echo "--- claude stdout ---"; cat claude.out
+            echo "--- claude stderr ---"; cat claude.err
+            if [ $i -lt $ATTEMPTS ]; then
+              SLEEP=$((i * 30)); echo "Retrying in ${SLEEP}s..."; sleep $SLEEP
+            fi
+          done
+          if [ $RC -eq 0 ] && [ -n "$REVIEW" ]; then printf '%s\n' "$REVIEW"; fi
+          echo "::endgroup::"
+
+          # Outcome. A GLM error/timeout (or empty output) FAILS the check.
+          if [ $RC -ne 0 ] || [ -z "$REVIEW" ]; then
+            REVIEW=$'> :x: **Claude review failed to run** after 3 attempts (Z.AI overloaded / timeout) — see the job log above.'
+            STATE=failure; HEADER='❌ Review failed to run'
+          elif printf '%s' "$REVIEW" | grep -qiE '^[[:space:]]*VERDICT:[[:space:]]*FAIL'; then
+            STATE=failure; HEADER='❌ Changes requested'
+          else
+            STATE=success; HEADER='✅ Looks good'
+          fi
+
+          BODY=$(printf '## Claude Code review — %s\n\n%s\n\n<sub>glm-4.7 via Z.AI · automated, non-authoritative</sub>\n' \
+            "$HEADER" "$REVIEW")
+
+          echo "::group::Post comment + commit status"
+          jq -n --arg b "$BODY" '{body:$b}' \
+            | curl -fsSL -X POST -H "Authorization: token ${REPO_TOKEN}" \
+                -H 'Content-Type: application/json' \
+                "${API_URL}/repos/${REPO}/issues/${PR_NUMBER}/comments" -d @- -o /dev/null \
+            && echo "comment posted" \
+            || echo "WARN: comment POST failed (Actions token may lack write — see notes)"
+
+          jq -n --arg s "$STATE" \
+            '{state:$s, context:"claude-review", description:"Claude Code (GLM) PR review"}' \
+            | curl -fsSL -X POST -H "Authorization: token ${REPO_TOKEN}" \
+                -H 'Content-Type: application/json' \
+                "${API_URL}/repos/${REPO}/statuses/${HEAD_SHA}" -d @- -o /dev/null \
+            && echo "status set: $STATE" \
+            || echo "WARN: status POST failed (Actions token may lack write — see notes)"
+          echo "::endgroup::"
+
+          [ "$STATE" = success ] || { echo "Verdict: FAIL — failing the job."; exit 1; }
