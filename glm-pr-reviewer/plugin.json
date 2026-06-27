@@ -1,0 +1,13 @@
+{
+  "name": "glm-pr-reviewer",
+  "version": "1.0.0",
+  "description": "Set up an automated AI pull-request reviewer on Gitea or Forgejo Actions that runs Claude Code (headless) against a GLM model via the Z.AI Anthropic-compatible endpoint, posts the review as a PR comment, and sets a pass/fail status check that can gate merges. Use for AI code review in CI on self-hosted git servers, wiring Claude Code/GLM into Actions, or debugging an existing Claude-Code-on-Actions reviewer",
+  "author": {
+    "name": "Rob Anderson"
+  },
+  "components": {
+    "skills": [
+      "glm-pr-reviewer"
+    ]
+  }
+}
