@@ -18,9 +18,25 @@ description: >-
 
 This skill installs a CI workflow that reviews every pull request with Claude
 Code, using a GLM model (e.g. `glm-5.2`) through Z.AI's Anthropic-compatible
-endpoint instead of Anthropic's API. It posts the review as a PR comment and
-sets a `claude-review` commit status, and it fails the check on a `FAIL`
-verdict or a GLM error so it can gate merges via branch protection.
+endpoint instead of Anthropic's API. It posts the review as a sticky PR comment
+and sets a `claude-review` commit status. It is **fail-closed**: only an explicit
+`VERDICT: PASS` is green — a `FAIL`, a missing/ambiguous verdict, a GLM error, or
+a deterministic pre-gate hit all go red, so it can gate merges via branch
+protection.
+
+## Quickstart
+
+1. Drop `assets/claude-pr-review.yml` into `.forgejo/workflows/` (Forgejo) or
+   `.gitea/workflows/` (Gitea).
+2. Add an Actions secret `ZAI_API_KEY` = your Z.AI key (repo, or org/global).
+3. Confirm a runner with the `ubuntu-latest` label is online.
+4. Open a trivial PR — within seconds you get a sticky "Claude Code review"
+   comment and a `claude-review` status check.
+5. (Optional) Require the `claude-review` check in branch protection to gate
+   merges.
+
+Defaults are sane (model `glm-5.2`, fail-closed, prompt-injection-resistant);
+the rest of this doc explains how it works and how to tune it.
 
 ## How it works (so you can explain it)
 
@@ -29,8 +45,10 @@ verdict or a GLM error so it can gate merges via branch protection.
 - When a PR opens/updates, the daemon spawns a **fresh ephemeral container**
   from the job's label image (e.g. `catthehacker/ubuntu:act-latest`) and runs
   the steps inside it. The container is discarded after the job.
-- The job: install the Claude Code CLI → fetch the PR diff via the server API →
-  run `claude -p` against GLM → post a comment + commit status via the API.
+- The job: install a **pinned** Claude Code CLI → fetch the PR diff via the
+  server API (fail-closed if it can't) → run a cheap **deterministic pre-gate**
+  over the diff → run `claude -p` against GLM with the diff fenced as **untrusted
+  data** → **update a single sticky** PR comment + set the commit status.
 - Claude Code talks to GLM because `ANTHROPIC_BASE_URL` points at
   `https://api.z.ai/api/anthropic` and `ANTHROPIC_AUTH_TOKEN` carries the Z.AI
   key. GLM speaks the Anthropic wire format, so the CLI needs no changes.
@@ -93,41 +111,74 @@ see a "Claude Code review" comment plus a `claude-review` check.
 ### 5. (Optional) Gate merges
 
 Add a branch-protection rule requiring the `claude-review` status check (or the
-workflow's own job check). A `VERDICT: FAIL` or an exhausted GLM retry turns the
-check red and blocks the merge.
+workflow's own job check). Because the check is fail-closed, anything other than
+an explicit `VERDICT: PASS` — a `FAIL`, a missing/ambiguous verdict, a pre-gate
+blocker, or an exhausted GLM retry — turns it red and blocks the merge.
 
 ## The workflow's built-in behavior (worth knowing)
 
 These exist because each one fixed a real failure — keep them when editing:
 
-- **`set +e` at the top.** Actions runs steps with `bash -e -o pipefail`, so a
-  non-zero `claude` exit would kill the step before the error could be reported
+- **`set +e`, never `set -x`.** Actions runs steps with `bash -e -o pipefail`, so
+  a non-zero `claude` exit would kill the step before the error could be reported
   or a comment posted. The workflow disables errexit and handles return codes
-  explicitly.
-- **Diagnostics on failure.** It captures `claude` stdout *and* stderr and
-  prints them, so a failure shows the real cause (e.g. a Z.AI `529`) instead of
-  a silent red X.
-- **Retry on overload.** Z.AI intermittently returns `HTTP 529` ("service
-  overloaded"), especially for premium models on free/coding-plan tiers. The
-  job retries `ANTHROPIC_MODEL` up to 3 times with backoff before failing.
-- **Fail-closed.** A GLM error/timeout (after retries) or a `VERDICT: FAIL`
-  exits non-zero so the check goes red. A clean review with `VERDICT: PASS` is
-  green.
-- **Verdict contract.** The prompt instructs the model to end with exactly
-  `VERDICT: PASS` or `VERDICT: FAIL` (FAIL only for blocker-level findings); the
-  job greps for that to decide the status.
+  explicitly. It never enables `set -x` (that would echo secrets).
+- **Secret masking.** It `::add-mask::`es the Z.AI key and repo token up front, so
+  they can't surface in logs even via an error echo.
+- **Fail-closed verdict, aggregated in shell.** Only an explicit last-line
+  `VERDICT: PASS` (tolerant of markdown bold/backticks and case) goes green.
+  `FAIL`, a *missing* or ambiguous verdict, a GLM error/timeout, or a pre-gate
+  blocker all go red. The outcome is decided in shell, never by the model.
+- **Deterministic pre-gate (hybrid gate-then-judge).** Before spending tokens,
+  cheap high-confidence rules scan the diff for unresolved merge-conflict markers
+  and obvious hardcoded credentials. A hit forces red *and* is fed to the model
+  as authoritative ground truth.
+- **Prompt-injection resistance.** The diff is fenced as `UNTRUSTED PR DIFF` and
+  the prompt forbids following instructions inside it; an injection attempt is
+  itself a Blocker.
+- **Sticky comment.** It finds its prior comment via a hidden marker and
+  *updates* it, so an active PR gets one evolving review comment instead of a new
+  comment on every push.
+- **Concurrency.** A per-PR concurrency group cancels an in-flight run when a new
+  commit lands, so two jobs never race over the comment/status. (Needs a recent
+  server — see the note in the YAML; delete the block on older Gitea.)
+- **Pinned CLI.** Installs `@anthropic-ai/claude-code@$CLAUDE_CODE_VERSION` for
+  reproducibility instead of a floating `latest`.
+- **Diagnostics + 529-only retry.** Captures `claude` stdout *and* stderr on
+  failure; retries **only** on a Z.AI `529` overload — other errors fail fast
+  instead of burning ~3 min per attempt.
+- **Diff-fetch fail-closed + truncation.** A non-200 diff fetch reds the check
+  rather than reviewing nothing; oversized diffs are truncated with a marker the
+  model is told about; a genuinely empty diff passes as "no reviewable changes".
 
 ## Customizing
 
-- **Review prompt:** edit the `REVIEW_PROMPT` block in the env. It's a plain
-  multi-line string — adjust what the reviewer looks for or how it scores.
-- **Diff size cap:** `head -c 300000 pr.diff` keeps huge PRs within model
-  context; raise/lower as needed.
-- **Retry count:** the `ATTEMPTS=3` loop variable.
-- **Repo-aware review:** the default reviews the diff text only (safest against
-  prompt injection from a malicious PR). To let Claude read surrounding files,
-  add `--allowedTools "Read,Grep,Glob"` to the `claude -p` call and check out
-  the repo first — but understand the injection trade-off.
+- **Review prompt:** edit the `REVIEW_PROMPT` block in the env. Keep the
+  UNTRUSTED-diff security contract and the final `VERDICT:` line — the job
+  depends on both.
+- **Model:** `ANTHROPIC_MODEL` (the comment footer is derived from it, so the
+  label can never drift from the model actually used).
+- **Pinned CLI version:** `CLAUDE_CODE_VERSION` — bump deliberately; set to
+  `latest` only if you accept unpinned installs.
+- **Diff size cap:** `MAX_DIFF_BYTES` (default `300000`).
+- **Retry count:** `ATTEMPTS` (applies to Z.AI `529` only).
+- **Pre-gate:** the `Deterministic pre-gate` group — add high-confidence rules
+  (lint/format/secret patterns). Keep them ~zero-false-positive, since a hit
+  forces the check red.
+
+### Repo-aware review (threat model — use with care)
+
+The default reviews the **diff text only**. That is the safe posture against two
+attacks from an untrusted PR: prompt **injection** (the diff telling the reviewer
+to pass) and data **exfiltration** (the diff telling the reviewer to read a
+secret/file and echo it into the public comment). The diff is fenced as untrusted
+and the verdict is aggregated in shell, so injection can't flip the gate.
+
+To let Claude read surrounding files, add `--allowedTools "Read,Grep,Glob"` to the
+`claude -p` call and check out the repo first — but understand you are handing
+attacker-controlled text a file-read tool whose output lands in a public comment.
+Only enable this where PR authors are trusted (or add egress/secret controls).
+Never grant write/exec tools.
 
 ## Troubleshooting
 

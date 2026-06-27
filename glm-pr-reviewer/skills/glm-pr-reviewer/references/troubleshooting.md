@@ -21,10 +21,10 @@ API Error: 529 [1305][The service may be temporarily overloaded, please try agai
 ```
 
 This is server-side on Z.AI, not your setup. It's more common for premium models
-(`glm-5.2`) on free/coding-plan tiers during peak load. The workflow already
-retries `ATTEMPTS` times with backoff. Options if it persists: switch
-`ANTHROPIC_MODEL` to a lighter, more-available model (`glm-4.7`, `glm-4.5-air`),
-raise `ATTEMPTS`, or just re-run when Z.AI recovers.
+(`glm-5.2`) on free/coding-plan tiers during peak load. The workflow retries
+`ATTEMPTS` times with backoff **on 529 only** (other errors fail fast). Options
+if it persists: switch `ANTHROPIC_MODEL` to a lighter, more-available model
+(`glm-4.7`, `glm-4.5-air`), raise `ATTEMPTS`, or just re-run when Z.AI recovers.
 
 ## The step dies with no error output at all
 
@@ -39,9 +39,31 @@ See `runner-setup.md` → gotchas: a reused TrueNAS ixVolume with a stale
 `.runner`, or the Forgejo declarative token-format error
 ("token contains invalid characters").
 
+## The check is red but the review reads fine / has no VERDICT line
+
+By design. The check is **fail-closed**: only an explicit last-line
+`VERDICT: PASS` is green. If the model omitted the verdict, wrapped it oddly, or
+emitted `VERDICT: FAIL`, the status goes red. If GLM keeps dropping the verdict
+line, tighten the tail of `REVIEW_PROMPT` (it already demands an exact last
+line), or lower the model tier — weaker models follow the format less reliably.
+
+## "Blocked by pre-gate"
+
+The deterministic pre-gate (run before the model) found an unresolved
+merge-conflict marker or a high-confidence hardcoded-credential pattern in the
+added lines, and forces the check red regardless of the model. Read the
+"Deterministic pre-gate" log group; fix the diff, or — if it's a false positive
+— tune the patterns in that group (keep them ~zero-false-positive).
+
+## `concurrency` error / runner rejects the workflow
+
+Older Gitea (pre ~1.24) doesn't support the top-level `concurrency:` block.
+Delete that block from the YAML — everything else works without it (you just
+lose automatic cancel-on-new-push).
+
 ## Comment posts but the commit status 403s (Gitea)
 
-Symptom in the log: `comment posted` then
+Symptom in the log: `comment posted`/`comment updated` then
 `WARN: status POST failed`, and curl returns `403`. The Gitea Actions token can
 post issue comments but is refused on `POST /repos/.../statuses/{sha}`. The
 job's own check still goes red on failure, so merge-gating works via the
