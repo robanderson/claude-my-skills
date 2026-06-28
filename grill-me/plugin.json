@@ -1,7 +1,7 @@
 {
   "name": "grill-me",
-  "version": "1.0.0",
-  "description": "Relentless one-question-at-a-time Socratic interview that stress-tests a plan, design, or decision BEFORE any code is written. Maps the decision tree, resolves the highest-impact unknowns first with a recommended answer on every question, explores the codebase instead of asking when answers are discoverable, surfaces dependencies between decisions, pushes back on risky or contradictory choices, tracks resolved-vs-open branches, and ends in a structured shared understanding. Planning-only. Use when someone says \"grill me\", or wants to poke holes in / pressure-test / red-team / pre-mortem a plan before building.",
+  "version": "2.0.0",
+  "description": "Relentless one-question-at-a-time Socratic interview that stress-tests a plan, design, or decision BEFORE any code is written. Every question now offers an ordered top 3-4 answer options + a free-type slot. Maps the decision tree, resolves the highest-impact unknowns first, explores the codebase instead of asking when answers are discoverable, surfaces dependencies, pushes back on risky or contradictory choices, and ends in a structured shared understanding. Basic mode generates the options inline; opt-in HARD mode (\"grill me hard\") assembles the whole question list, runs one tournament workflow (grill-hard.workflow.js) to pre-compute ranked options per question, then runs the same drift-aware interview. Planning-only. Use when someone says \"grill me\" / \"grill me hard\", or wants to poke holes in / pressure-test / red-team / pre-mortem a plan before building.",
   "author": {
     "name": "Rob Anderson"
   },
