@@ -35,6 +35,11 @@
       "name": "glm-pr-reviewer",
       "description": "Set up an automated AI pull-request reviewer on Gitea or Forgejo Actions that runs Claude Code (headless) against a GLM model via the Z.AI Anthropic-compatible endpoint, posts the review as a PR comment, and sets a pass/fail status check that can gate merges. Use for AI code review in CI on self-hosted git servers, wiring Claude Code/GLM into Actions, or debugging an existing Claude-Code-on-Actions reviewer",
       "source": "./glm-pr-reviewer"
+    },
+    {
+      "name": "grill-me",
+      "description": "Relentless one-question-at-a-time Socratic interview that stress-tests a plan or design before any code is written. Maps the decision tree, resolves the highest-impact unknowns first with a recommended answer each, surfaces dependencies, pushes back on risky choices, and ends in a structured shared understanding. Planning-only. Use when someone says 'grill me' or wants to poke holes in / pressure-test / pre-mortem a plan",
+      "source": "./grill-me"
     }
   ]
 }
